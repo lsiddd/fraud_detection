@@ -1,0 +1,562 @@
+"""
+run_experiments.py — orquestração do framework de detecção de fraudes.
+
+Treina e avalia 4 algoritmos (XGBoost, Isolation Forest, Autoencoder, GNN)
+nos datasets CC e IEEE, depois gera 5 figuras comparativas.
+"""
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+from scipy.stats import ks_2samp
+from sklearn.metrics import (
+    roc_auc_score,
+    average_precision_score,
+    precision_recall_curve,
+    roc_curve,
+    f1_score,
+    precision_score,
+    recall_score,
+    matthews_corrcoef,
+)
+
+from preprocessing import (
+    load_datasets,
+    prepare_numeric,
+    prepare_xgboost,
+    prepare_xgboost_all,
+    prepare_gnn,
+    prepare_gat_cc,
+    prepare_gat_ieee,
+    CC_NUM_FEATS,
+    IEEE_NUM_FEATS,
+    IEEE_CAT_FEATS,
+)
+from detectors import (
+    XGBoostDetector,
+    IsolationForestDetector,
+    AutoencoderDetector,
+    GATDetector,
+    GATXGBDetector,
+    GNNDetector,
+    GraphSAGEXGBDetector,
+    LightGBMDetector,
+    CatBoostDetector,
+    TabNetDetector,
+    StackingDetector,
+    build_cc_graph,
+    build_cc_graph_cosine,
+    build_ieee_graph,
+    build_ieee_graph_edges,
+    normalize_adj,
+)
+import reporting
+
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+# Sem subsampling — datasets completos para avaliação justa
+SEED = 42
+
+
+def compute_metrics(y_test, scores):
+    """Returns dict with roc_auc, pr_auc, gini, ks, f1, precision, recall, mcc, fpr_at_90rec."""
+    roc_auc = roc_auc_score(y_test, scores)
+    pr_auc  = average_precision_score(y_test, scores)
+    gini    = 2.0 * roc_auc - 1.0
+
+    # KS Statistic: max separation between fraud and legit score CDFs
+    ks_stat, _ = ks_2samp(scores[y_test == 1], scores[y_test == 0])
+
+    # Best F1 threshold
+    precs, recs, threshs = precision_recall_curve(y_test, scores)
+    # f1s has same length as threshs (precs/recs have one extra element)
+    f1s = 2 * precs[:-1] * recs[:-1] / (precs[:-1] + recs[:-1] + 1e-8)
+    best_idx = np.argmax(f1s)
+    best_thresh = threshs[best_idx]
+
+    y_pred = (scores >= best_thresh).astype(int)
+    f1   = f1_score(y_test, y_pred, zero_division=0)
+    prec = precision_score(y_test, y_pred, zero_division=0)
+    rec  = recall_score(y_test, y_pred, zero_division=0)
+    mcc  = matthews_corrcoef(y_test, y_pred)
+
+    # FPR at 90% Recall: how many legit transactions are flagged to catch 90% of fraud
+    fpr_arr, tpr_arr, _ = roc_curve(y_test, scores)
+    fpr_at_90rec = float(np.interp(0.90, tpr_arr, fpr_arr))
+
+    return dict(
+        roc_auc=roc_auc, pr_auc=pr_auc, gini=gini, ks=ks_stat,
+        f1=f1, precision=prec, recall=rec, mcc=mcc,
+        fpr_at_90rec=fpr_at_90rec,
+    )
+
+
+def run_dataset(name, df, label_col, num_feats, cat_feats,
+                graph_builder, algos=None, seed=SEED):
+    """
+    Treina e avalia os 4 detectores em um dataset completo.
+    Retorna lista de result dicts.
+    """
+    print(f"\n{'='*60}")
+    print(f"Dataset: {name}  ({len(df):,} linhas — dataset completo)")
+    print(f"{'='*60}")
+
+    df_s = df.reset_index(drop=True)
+    print(f"  Total: {len(df_s):,} linhas  "
+          f"(fraude={df_s[label_col].mean()*100:.2f}%)")
+
+    # ── 2. Preparação numérica (para IF, AE, GNN) ──────────────────────────────
+    X_all, y_all, X_tr, X_te, y_tr, y_te, idx_tr, idx_te = prepare_numeric(
+        df_s, num_feats, label_col, seed=seed
+    )
+    print(f"  Features numéricas: {X_all.shape[1]}  "
+          f"| treino={len(y_tr):,}  teste={len(y_te):,}")
+
+    # ── 3. Preparação para XGBoost ─────────────────────────────────────────────
+    Xg_tr, Xg_te, yg_tr, yg_te = prepare_xgboost(
+        df_s, num_feats, cat_feats, label_col, seed=seed
+    )
+
+    # Índices e cardinalidades das features categóricas (CatBoost e TabNet)
+    _avail_num = [c for c in num_feats if c in df_s.columns]
+    _avail_cat = [c for c in cat_feats if c in df_s.columns]
+    cat_idxs = list(range(len(_avail_num), len(_avail_num) + len(_avail_cat)))
+    cat_dims  = [int(df_s[c].nunique()) + 1 for c in _avail_cat]
+
+    if algos is None:
+        algos = [
+            "XGBoost", "Isolation Forest", "Autoencoder",
+            "GNN (GATv2)", "GAT+XGB", "GNN (GCN)",
+            "GraphSAGE+XGB", "LightGBM", "CatBoost", "TabNet", "Stacking",
+        ]
+
+    results = []
+    _adj_cache = {}  # cache para não construir o grafo duas vezes
+
+    def get_adj():
+        """Adjacência scipy (para GCN / GraphSAGE+XGB)."""
+        if "adj" not in _adj_cache:
+            _adj_cache["adj"] = graph_builder(X_all, df_s)
+        return _adj_cache["adj"]
+
+    def get_gat_data():
+        """
+        Retorna (X_gat, times, y_gat, idx_tr_gat, idx_val_gat, idx_te_gat,
+                 edge_index) para GATv2 com split cronológico e grafo causal.
+        Resultado cacheado para não repetir o k-NN.
+        """
+        if "gat" not in _adj_cache:
+            if name == "CC":
+                X_gat, X_pca, times, y_gat, i_tr, i_val, i_te = \
+                    prepare_gat_cc(df_s)
+                ei = build_cc_graph_cosine(X_pca, times=times,
+                                           k=5, cos_dist_threshold=0.10)
+            else:
+                X_gat, times, y_gat, i_tr, i_val, i_te = \
+                    prepare_gat_ieee(df_s)
+                ei = build_ieee_graph_edges(df_s, max_per_card=100)
+            _adj_cache["gat"] = (X_gat, y_gat, i_tr, i_val, i_te, ei)
+        return _adj_cache["gat"]
+
+    # ── 4. XGBoost ─────────────────────────────────────────────────────────────
+    if "XGBoost" in algos:
+        print("\n  [XGBoost]")
+        det = XGBoostDetector(seed=seed)
+        det.fit(Xg_tr, yg_tr)
+        scores = det.score(Xg_te)
+        metrics = compute_metrics(yg_te, scores)
+        results.append(dict(
+            name="XGBoost", dataset=name,
+            y_test=yg_te, scores=scores,
+            train_time=det.train_time,
+            **metrics,
+        ))
+        print(f"    ROC-AUC={metrics['roc_auc']:.4f}  PR-AUC={metrics['pr_auc']:.4f}"
+              f"  F1={metrics['f1']:.4f}  t={det.train_time:.1f}s")
+
+    # ── 5. Isolation Forest ────────────────────────────────────────────────────
+    if "Isolation Forest" in algos:
+        print("  [Isolation Forest]")
+        det = IsolationForestDetector(seed=seed)
+        det.fit(X_tr, y_tr)
+        scores = det.score(X_te)
+        metrics = compute_metrics(y_te, scores)
+        results.append(dict(
+            name="Isolation Forest", dataset=name,
+            y_test=y_te, scores=scores,
+            train_time=det.train_time,
+            **metrics,
+        ))
+        print(f"    ROC-AUC={metrics['roc_auc']:.4f}  PR-AUC={metrics['pr_auc']:.4f}"
+              f"  F1={metrics['f1']:.4f}  t={det.train_time:.1f}s")
+
+    # ── 6. Autoencoder ─────────────────────────────────────────────────────────
+    if "Autoencoder" in algos:
+        print("  [Autoencoder]")
+        det = AutoencoderDetector(seed=seed)
+        det.fit(X_tr, y_tr)
+        scores = det.score(X_te)
+        metrics = compute_metrics(y_te, scores)
+        results.append(dict(
+            name="Autoencoder", dataset=name,
+            y_test=y_te, scores=scores,
+            train_time=det.train_time,
+            **metrics,
+        ))
+        print(f"    ROC-AUC={metrics['roc_auc']:.4f}  PR-AUC={metrics['pr_auc']:.4f}"
+              f"  F1={metrics['f1']:.4f}  t={det.train_time:.1f}s")
+
+    # ── 7. GATv2 (SOTA — indutivo, split cronológico, grafo causal) ───────────
+    if "GNN (GATv2)" in algos:
+        print("\n  [GNN (GATv2)]")
+        X_gat, y_gat, i_tr_gat, i_val_gat, i_te_gat, edge_index = \
+            get_gat_data()
+
+        N_gat = len(y_gat)
+        train_mask_gat = np.zeros(N_gat, dtype=bool)
+        val_mask_gat   = np.zeros(N_gat, dtype=bool)
+        test_mask_gat  = np.zeros(N_gat, dtype=bool)
+        train_mask_gat[i_tr_gat]  = True
+        val_mask_gat[i_val_gat]   = True
+        test_mask_gat[i_te_gat]   = True
+
+        det = GATDetector(seed=seed)
+        det.fit(X_gat, y_gat, train_mask_gat, test_mask_gat, edge_index,
+                val_mask=val_mask_gat)
+
+        scores      = det.score()
+        y_te_gat    = y_gat[i_te_gat]
+        metrics     = compute_metrics(y_te_gat, scores)
+        results.append(dict(
+            name="GNN (GATv2)", dataset=name,
+            y_test=y_te_gat, scores=scores,
+            train_time=det.train_time,
+            **metrics,
+        ))
+        print(f"    ROC-AUC={metrics['roc_auc']:.4f}  PR-AUC={metrics['pr_auc']:.4f}"
+              f"  F1={metrics['f1']:.4f}  t={det.train_time:.1f}s")
+
+    # ── 7.5. GAT+XGB ───────────────────────────────────────────────────────────
+    if "GAT+XGB" in algos:
+        print("\n  [GAT+XGB]")
+        X_gat, y_gat, i_tr_gat, i_val_gat, i_te_gat, edge_index = \
+            get_gat_data()
+
+        N_gat = len(y_gat)
+        train_mask_gat = np.zeros(N_gat, dtype=bool)
+        val_mask_gat   = np.zeros(N_gat, dtype=bool)
+        test_mask_gat  = np.zeros(N_gat, dtype=bool)
+        train_mask_gat[i_tr_gat]  = True
+        val_mask_gat[i_val_gat]   = True
+        test_mask_gat[i_te_gat]   = True
+
+        # Features tabulares alinhadas ao split cronológico do GAT
+        Xg_all_xgb, _ = prepare_xgboost_all(df_s, num_feats, cat_feats, label_col)
+        Xg_gat_tr = Xg_all_xgb[i_tr_gat]
+        yg_gat_tr  = y_gat[i_tr_gat]
+        Xg_gat_te  = Xg_all_xgb[i_te_gat]
+
+        det = GATXGBDetector(seed=seed)
+        det.fit(X_gat, y_gat, train_mask_gat, test_mask_gat, edge_index,
+                Xg_gat_tr, yg_gat_tr, val_mask=val_mask_gat)
+
+        scores   = det.score(Xg_gat_te)
+        y_te_gat = y_gat[i_te_gat]
+        metrics  = compute_metrics(y_te_gat, scores)
+        results.append(dict(
+            name="GAT+XGB", dataset=name,
+            y_test=y_te_gat, scores=scores,
+            train_time=det.train_time,
+            **metrics,
+        ))
+        print(f"    ROC-AUC={metrics['roc_auc']:.4f}  PR-AUC={metrics['pr_auc']:.4f}"
+              f"  F1={metrics['f1']:.4f}  t={det.train_time:.1f}s")
+
+    # ── 8. GNN (GCN) ───────────────────────────────────────────────────────────
+    if "GNN (GCN)" in algos:
+        print("  [GNN (GCN)]")
+        adj = get_adj()
+        adj_norm = normalize_adj(adj)
+
+        # Features completas (numéricas + categóricas) — mesma vantagem do XGBoost
+        X_gnn = prepare_gnn(df_s, num_feats, cat_feats, label_col)
+
+        N = len(y_all)
+        train_mask = np.zeros(N, dtype=bool)
+        test_mask  = np.zeros(N, dtype=bool)
+        train_mask[idx_tr] = True
+        test_mask[idx_te]  = True
+
+        det = GNNDetector(seed=seed)
+        det.fit(X_gnn, y_all, train_mask, test_mask, adj_norm)
+        scores = det.score()
+        metrics = compute_metrics(y_te, scores)
+        results.append(dict(
+            name="GNN (GCN)", dataset=name,
+            y_test=y_te, scores=scores,
+            train_time=det.train_time,
+            **metrics,
+        ))
+        print(f"    ROC-AUC={metrics['roc_auc']:.4f}  PR-AUC={metrics['pr_auc']:.4f}"
+              f"  F1={metrics['f1']:.4f}  t={det.train_time:.1f}s")
+
+    # ── 8. GraphSAGE+XGB ───────────────────────────────────────────────────────
+    if "GraphSAGE+XGB" in algos:
+        print("\n  [GraphSAGE+XGB]")
+        adj = get_adj()
+
+        X_gnn = prepare_gnn(df_s, num_feats, cat_feats, label_col)
+
+        N = len(y_all)
+        train_mask = np.zeros(N, dtype=bool)
+        test_mask  = np.zeros(N, dtype=bool)
+        train_mask[idx_tr] = True
+        test_mask[idx_te]  = True
+
+        det = GraphSAGEXGBDetector(seed=seed)
+        det.fit(X_gnn, y_all, train_mask, test_mask, adj, Xg_tr, yg_tr)
+        scores = det.score(Xg_te)
+        metrics = compute_metrics(yg_te, scores)
+        results.append(dict(
+            name="GraphSAGE+XGB", dataset=name,
+            y_test=yg_te, scores=scores,
+            train_time=det.train_time,
+            **metrics,
+        ))
+        print(f"    ROC-AUC={metrics['roc_auc']:.4f}  PR-AUC={metrics['pr_auc']:.4f}"
+              f"  F1={metrics['f1']:.4f}  t={det.train_time:.1f}s")
+
+    # ── 9. LightGBM ────────────────────────────────────────────────────────────
+    if "LightGBM" in algos:
+        print("  [LightGBM]")
+        det = LightGBMDetector(seed=seed)
+        det.fit(Xg_tr, yg_tr)
+        scores = det.score(Xg_te)
+        metrics = compute_metrics(yg_te, scores)
+        results.append(dict(
+            name="LightGBM", dataset=name,
+            y_test=yg_te, scores=scores,
+            train_time=det.train_time,
+            **metrics,
+        ))
+        print(f"    ROC-AUC={metrics['roc_auc']:.4f}  PR-AUC={metrics['pr_auc']:.4f}"
+              f"  F1={metrics['f1']:.4f}  t={det.train_time:.1f}s")
+
+    # ── 10. CatBoost ───────────────────────────────────────────────────────────
+    if "CatBoost" in algos:
+        print("  [CatBoost]")
+        det = CatBoostDetector(cat_features=cat_idxs, seed=seed)
+        det.fit(Xg_tr, yg_tr)
+        scores = det.score(Xg_te)
+        metrics = compute_metrics(yg_te, scores)
+        results.append(dict(
+            name="CatBoost", dataset=name,
+            y_test=yg_te, scores=scores,
+            train_time=det.train_time,
+            **metrics,
+        ))
+        print(f"    ROC-AUC={metrics['roc_auc']:.4f}  PR-AUC={metrics['pr_auc']:.4f}"
+              f"  F1={metrics['f1']:.4f}  t={det.train_time:.1f}s")
+
+    # ── 11. TabNet ─────────────────────────────────────────────────────────────
+    if "TabNet" in algos:
+        print("  [TabNet]")
+        det = TabNetDetector(seed=seed)
+        det.fit(Xg_tr, yg_tr, cat_idxs=cat_idxs, cat_dims=cat_dims)
+        scores = det.score(Xg_te)
+        metrics = compute_metrics(yg_te, scores)
+        results.append(dict(
+            name="TabNet", dataset=name,
+            y_test=yg_te, scores=scores,
+            train_time=det.train_time,
+            **metrics,
+        ))
+        print(f"    ROC-AUC={metrics['roc_auc']:.4f}  PR-AUC={metrics['pr_auc']:.4f}"
+              f"  F1={metrics['f1']:.4f}  t={det.train_time:.1f}s")
+
+    # ── 12. Stacking ───────────────────────────────────────────────────────────
+    if "Stacking" in algos:
+        print("  [Stacking]")
+        det = StackingDetector(seed=seed)
+        det.fit(Xg_tr, yg_tr)
+        scores = det.score(Xg_te)
+        metrics = compute_metrics(yg_te, scores)
+        results.append(dict(
+            name="Stacking", dataset=name,
+            y_test=yg_te, scores=scores,
+            train_time=det.train_time,
+            **metrics,
+        ))
+        print(f"    ROC-AUC={metrics['roc_auc']:.4f}  PR-AUC={metrics['pr_auc']:.4f}"
+              f"  F1={metrics['f1']:.4f}  t={det.train_time:.1f}s")
+
+    return results
+
+
+def print_summary(all_results):
+    """Imprime tabela resumo no terminal."""
+    header = (
+        f"{'Algoritmo':<20} {'Dataset':<8}"
+        f" {'ROC-AUC':>8} {'PR-AUC':>8} {'Gini':>7} {'KS':>7}"
+        f" {'MCC':>7} {'F1':>7} {'Prec':>7} {'Recall':>7}"
+        f" {'FPR@90R':>8} {'Tempo':>8}"
+    )
+    sep = "-" * len(header)
+    print(f"\n{sep}")
+    print(header)
+    print(sep)
+    for r in all_results:
+        print(
+            f"{r['name']:<20} {r['dataset']:<8}"
+            f" {r['roc_auc']:>8.4f} {r['pr_auc']:>8.4f}"
+            f" {r.get('gini', 0):>7.4f} {r.get('ks', 0):>7.4f}"
+            f" {r.get('mcc', 0):>7.4f} {r['f1']:>7.4f}"
+            f" {r['precision']:>7.4f} {r['recall']:>7.4f}"
+            f" {r.get('fpr_at_90rec', 0):>8.4f} {r['train_time']:>7.1f}s"
+        )
+    print(sep)
+
+
+ALGO_ALIASES = {
+    "xgb":       "XGBoost",
+    "xgboost":   "XGBoost",
+    "if":        "Isolation Forest",
+    "iso":       "Isolation Forest",
+    "ae":        "Autoencoder",
+    "auto":      "Autoencoder",
+    "gat":       "GNN (GATv2)",
+    "gatv2":     "GNN (GATv2)",
+    "gatxgb":    "GAT+XGB",
+    "gat+xgb":   "GAT+XGB",
+    "gatxgboost":"GAT+XGB",
+    "gnn":       "GNN (GCN)",
+    "gcn":       "GNN (GCN)",
+    "sage":      "GraphSAGE+XGB",
+    "sagexgb":   "GraphSAGE+XGB",
+    "graphsage": "GraphSAGE+XGB",
+    "lgb":       "LightGBM",
+    "lgbm":      "LightGBM",
+    "lightgbm":  "LightGBM",
+    "cat":       "CatBoost",
+    "catboost":  "CatBoost",
+    "tabnet":    "TabNet",
+    "tab":       "TabNet",
+    "stack":     "Stacking",
+    "stacking":  "Stacking",
+}
+
+DATASET_ALIASES = {
+    "cc":   "CC",
+    "ieee": "IEEE",
+}
+
+
+def parse_args():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Detecção de fraudes — roda algoritmos selecionados.",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument(
+        "-a", "--algo",
+        nargs="+",
+        metavar="ALGO",
+        help=(
+            "Algoritmo(s) a executar (padrão: todos).\n"
+            "Opções: xgb/xgboost | if/iso | ae/auto\n"
+            "        gat/gatv2 | gatxgb/gat+xgb | gnn/gcn | sage/sagexgb/graphsage\n"
+            "        lgb/lgbm/lightgbm | cat/catboost\n"
+            "        tab/tabnet | stack/stacking"
+        ),
+    )
+    parser.add_argument(
+        "-d", "--dataset",
+        nargs="+",
+        metavar="DATASET",
+        help=(
+            "Dataset(s) a usar (padrão: ambos).\n"
+            "Opções: cc | ieee"
+        ),
+    )
+    parser.add_argument(
+        "--no-plots",
+        action="store_true",
+        help="Não gera os gráficos ao final.",
+    )
+    return parser.parse_args()
+
+
+def resolve_selection(raw_list, alias_map, label):
+    """Converte aliases digitados para nomes canônicos; aborta se inválido."""
+    if not raw_list:
+        return list(dict.fromkeys(alias_map.values()))  # todos, sem duplicatas
+    resolved = []
+    for token in raw_list:
+        key = token.lower()
+        if key not in alias_map:
+            valid = ", ".join(sorted(set(alias_map.keys())))
+            raise SystemExit(f"[erro] {label} desconhecido: '{token}'. Válidos: {valid}")
+        canonical = alias_map[key]
+        if canonical not in resolved:
+            resolved.append(canonical)
+    return resolved
+
+
+def main():
+    args = parse_args()
+
+    algos   = resolve_selection(args.algo,    ALGO_ALIASES,    "algoritmo")
+    datasets = resolve_selection(args.dataset, DATASET_ALIASES, "dataset")
+
+    print(f"Algoritmos : {', '.join(algos)}")
+    print(f"Datasets   : {', '.join(datasets)}")
+
+    # ── Carregar dados ─────────────────────────────────────────────────────────
+    cc_df, ieee_df = load_datasets()
+
+    all_results = []
+
+    # ── CC ─────────────────────────────────────────────────────────────────────
+    if "CC" in datasets:
+        def cc_graph(X_all, df_s):
+            return build_cc_graph(X_all, k=10)
+
+        cc_results = run_dataset(
+            name="CC",
+            df=cc_df,
+            label_col="Class",
+            num_feats=CC_NUM_FEATS,
+            cat_feats=[],
+            graph_builder=cc_graph,
+            algos=algos,
+        )
+        all_results.extend(cc_results)
+
+    # ── IEEE ───────────────────────────────────────────────────────────────────
+    if "IEEE" in datasets:
+        def ieee_graph(X_all, df_s):
+            return build_ieee_graph(df_s, max_per_card=100)
+
+        ieee_results = run_dataset(
+            name="IEEE",
+            df=ieee_df,
+            label_col="isFraud",
+            num_feats=IEEE_NUM_FEATS,
+            cat_feats=IEEE_CAT_FEATS,
+            graph_builder=ieee_graph,
+            algos=algos,
+        )
+        all_results.extend(ieee_results)
+
+    # ── Relatórios ─────────────────────────────────────────────────────────────
+    if not args.no_plots and all_results:
+        reporting.generate_all(all_results)
+
+    # ── Tabela resumo ──────────────────────────────────────────────────────────
+    print_summary(all_results)
+
+
+if __name__ == "__main__":
+    main()
