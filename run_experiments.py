@@ -408,6 +408,9 @@ def print_summary(all_results):
     print(sep)
 
 
+TREE_ALGOS = ["XGBoost", "LightGBM", "CatBoost", "Isolation Forest", "Stacking"]
+DL_GRAPH_ALGOS = ["Autoencoder", "TabNet", "GNN (GATv2)", "GAT+XGB", "GNN (GCN)", "GraphSAGE+XGB"]
+
 ALGO_ALIASES = {
     "xgb":       "XGBoost",
     "xgboost":   "XGBoost",
@@ -449,7 +452,8 @@ def parse_args():
         description="Detecção de fraudes — roda algoritmos selecionados.",
         formatter_class=argparse.RawTextHelpFormatter,
     )
-    parser.add_argument(
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
         "-a", "--algo",
         nargs="+",
         metavar="ALGO",
@@ -460,6 +464,16 @@ def parse_args():
             "        lgb/lgbm/lightgbm | cat/catboost\n"
             "        tab/tabnet | stack/stacking"
         ),
+    )
+    group.add_argument(
+        "--trees",
+        action="store_true",
+        help=f"Roda só métodos de árvore: {', '.join(TREE_ALGOS)}.",
+    )
+    group.add_argument(
+        "--dl",
+        action="store_true",
+        help=f"Roda só métodos de DL e grafos: {', '.join(DL_GRAPH_ALGOS)}.",
     )
     parser.add_argument(
         "-d", "--dataset",
@@ -497,7 +511,12 @@ def resolve_selection(raw_list, alias_map, label):
 def main():
     args = parse_args()
 
-    algos   = resolve_selection(args.algo,    ALGO_ALIASES,    "algoritmo")
+    if args.trees:
+        algos = TREE_ALGOS
+    elif args.dl:
+        algos = DL_GRAPH_ALGOS
+    else:
+        algos = resolve_selection(args.algo, ALGO_ALIASES, "algoritmo")
     datasets = resolve_selection(args.dataset, DATASET_ALIASES, "dataset")
 
     print(f"Algoritmos : {', '.join(algos)}")
