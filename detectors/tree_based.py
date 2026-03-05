@@ -7,6 +7,7 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import numpy as np
+from detectors.base import BaseDetector
 
 
 def _fit_xgb(model_kwargs, X_t, y_t, X_val, y_val):
@@ -24,7 +25,7 @@ def _fit_xgb(model_kwargs, X_t, y_t, X_val, y_val):
 # 1. XGBoostDetector
 # ══════════════════════════════════════════════════════════════════════════════
 
-class XGBoostDetector:
+class XGBoostDetector(BaseDetector):
     name = "XGBoost"
 
     def __init__(self, n_estimators=300, seed=42):
@@ -67,7 +68,7 @@ class XGBoostDetector:
 # 7. LightGBMDetector  (DART booster)
 # ══════════════════════════════════════════════════════════════════════════════
 
-class LightGBMDetector:
+class LightGBMDetector(BaseDetector):
     name = "LightGBM"
 
     def __init__(self, n_estimators=1000, seed=42):
@@ -117,7 +118,7 @@ class LightGBMDetector:
 # 8. CatBoostDetector
 # ══════════════════════════════════════════════════════════════════════════════
 
-class CatBoostDetector:
+class CatBoostDetector(BaseDetector):
     name = "CatBoost"
 
     def __init__(self, iterations=1000, depth=8, cat_features=None, seed=42):

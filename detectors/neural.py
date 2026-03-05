@@ -7,13 +7,14 @@ import warnings
 warnings.filterwarnings("ignore")
 
 import numpy as np
+from detectors.base import BaseDetector
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. AutoencoderDetector
 # ══════════════════════════════════════════════════════════════════════════════
 
-class AutoencoderDetector:
+class AutoencoderDetector(BaseDetector):
     name = "Autoencoder"
 
     def __init__(self, epochs=150, batch_size=512, lr=1e-3, patience=15, seed=42):
@@ -115,7 +116,7 @@ class AutoencoderDetector:
 # 9. TabNetDetector
 # ══════════════════════════════════════════════════════════════════════════════
 
-class TabNetDetector:
+class TabNetDetector(BaseDetector):
     name = "TabNet"
 
     def __init__(self, max_epochs=200, patience=20, batch_size=1024,

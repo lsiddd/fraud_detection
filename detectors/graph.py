@@ -14,12 +14,13 @@ from sklearn.metrics.pairwise import cosine_similarity
 import scipy.sparse as sp
 
 from detectors.tree_based import _fit_xgb
+from detectors.base import BaseDetector
 
 # ══════════════════════════════════════════════════════════════════════════════
 # GATDetector  (indutivo, mini-batch, 2-layer GATv2 SOTA + Focal Loss)
 # ══════════════════════════════════════════════════════════════════════════════
 
-class GATDetector:
+class GATDetector(BaseDetector):
     """
     Detector indutivo em mini-lotes baseado em GATv2Conv (torch_geometric).
 
@@ -313,7 +314,7 @@ class GATDetector:
 # GATXGBDetector  (GATv2 feature extractor → XGBoost classifier)
 # ══════════════════════════════════════════════════════════════════════════════
 
-class GATXGBDetector:
+class GATXGBDetector(BaseDetector):
     """
     Híbrido em dois estágios análogo ao GraphSAGEXGBDetector, mas usando
     GATv2Conv (torch_geometric) como extrator de embeddings estruturais.
@@ -629,7 +630,7 @@ class GATXGBDetector:
 # GNNDetector  (transductive, 3-layer GCN)
 # ══════════════════════════════════════════════════════════════════════════════
 
-class GNNDetector:
+class GNNDetector(BaseDetector):
     name = "GNN (GCN)"
 
     def __init__(self, hidden=128, epochs=500, lr=3e-3, patience=30,
@@ -817,7 +818,7 @@ class GNNDetector:
 # 5. GraphSAGEXGBDetector  (GraphSAGE feature extractor → XGBoost classifier)
 # ══════════════════════════════════════════════════════════════════════════════
 
-class GraphSAGEXGBDetector:
+class GraphSAGEXGBDetector(BaseDetector):
     """
     Híbrido em dois estágios:
       1. GraphSAGE leve (2 camadas) treinado de forma supervisionada para

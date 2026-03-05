@@ -23,6 +23,7 @@ from sklearn.metrics import (
 
 from preprocessing import (
     load_datasets,
+    make_chronological_split,
     prepare_numeric,
     prepare_xgboost,
     prepare_xgboost_all,
@@ -32,6 +33,9 @@ from preprocessing import (
     CC_NUM_FEATS,
     IEEE_NUM_FEATS,
     IEEE_CAT_FEATS,
+    DatasetConfig,
+    CC_CONFIG,
+    IEEE_CONFIG,
 )
 from detectors import (
     XGBoostDetector,
@@ -92,35 +96,50 @@ def compute_metrics(y_test, scores):
     )
 
 
-def run_dataset(name, df, label_col, num_feats, cat_feats,
-                graph_builder, algos=None, seed=SEED):
+def _build_masks(N, idx_tr, idx_te, idx_val=None):
+    """Build boolean index masks from positional index arrays."""
+    train_mask = np.zeros(N, dtype=bool)
+    test_mask  = np.zeros(N, dtype=bool)
+    train_mask[idx_tr] = True
+    test_mask[idx_te]  = True
+    if idx_val is not None:
+        val_mask = np.zeros(N, dtype=bool)
+        val_mask[idx_val] = True
+        return train_mask, val_mask, test_mask
+    return train_mask, test_mask
+
+
+def run_dataset(cfg: DatasetConfig, df, graph_builder, algos=None, seed=SEED):
     """
     Treina e avalia os 4 detectores em um dataset completo.
     Retorna lista de result dicts.
     """
     print(f"\n{'='*60}")
-    print(f"Dataset: {name}  ({len(df):,} linhas — dataset completo)")
+    print(f"Dataset: {cfg.name}  ({len(df):,} linhas — dataset completo)")
     print(f"{'='*60}")
 
     df_s = df.reset_index(drop=True)
     print(f"  Total: {len(df_s):,} linhas  "
-          f"(fraude={df_s[label_col].mean()*100:.2f}%)")
+          f"(fraude={df_s[cfg.label_col].mean()*100:.2f}%)")
+
+    # ── Canonical chronological 70/15/15 split (same for all models) ───────────
+    idx_tr, idx_val, idx_te = make_chronological_split(df_s, cfg.time_col)
 
     # ── 2. Preparação numérica (para IF, AE, GNN) ──────────────────────────────
     X_all, y_all, X_tr, X_te, y_tr, y_te, idx_tr, idx_te = prepare_numeric(
-        df_s, num_feats, label_col, seed=seed
+        df_s, cfg.num_feats, cfg.label_col, idx_tr=idx_tr, idx_te=idx_te, seed=seed
     )
     print(f"  Features numéricas: {X_all.shape[1]}  "
           f"| treino={len(y_tr):,}  teste={len(y_te):,}")
 
     # ── 3. Preparação para XGBoost ─────────────────────────────────────────────
     Xg_tr, Xg_te, yg_tr, yg_te = prepare_xgboost(
-        df_s, num_feats, cat_feats, label_col, seed=seed
+        df_s, cfg.num_feats, cfg.cat_feats, cfg.label_col, idx_tr=idx_tr, idx_te=idx_te, seed=seed
     )
 
     # Índices e cardinalidades das features categóricas (CatBoost e TabNet)
-    _avail_num = [c for c in num_feats if c in df_s.columns]
-    _avail_cat = [c for c in cat_feats if c in df_s.columns]
+    _avail_num = [c for c in cfg.num_feats if c in df_s.columns]
+    _avail_cat = [c for c in cfg.cat_feats if c in df_s.columns]
     cat_idxs = list(range(len(_avail_num), len(_avail_num) + len(_avail_cat)))
     cat_dims  = [int(df_s[c].nunique()) + 1 for c in _avail_cat]
 
@@ -132,32 +151,22 @@ def run_dataset(name, df, label_col, num_feats, cat_feats,
         ]
 
     results = []
-    _adj_cache = {}  # cache para não construir o grafo duas vezes
 
-    def get_adj():
-        """Adjacência scipy (para GCN / GraphSAGE+XGB)."""
-        if "adj" not in _adj_cache:
-            _adj_cache["adj"] = graph_builder(X_all, df_s)
-        return _adj_cache["adj"]
+    # Graph adjacency (lazy — only if needed)
+    adj = None
+    if any(a in algos for a in ["GNN (GCN)", "GraphSAGE+XGB"]):
+        adj = graph_builder(X_all, df_s)
 
-    def get_gat_data():
-        """
-        Retorna (X_gat, times, y_gat, idx_tr_gat, idx_val_gat, idx_te_gat,
-                 edge_index) para GATv2 com split cronológico e grafo causal.
-        Resultado cacheado para não repetir o k-NN.
-        """
-        if "gat" not in _adj_cache:
-            if name == "CC":
-                X_gat, X_pca, times, y_gat, i_tr, i_val, i_te = \
-                    prepare_gat_cc(df_s)
-                ei = build_cc_graph_cosine(X_pca, times=times,
-                                           k=5, cos_dist_threshold=0.10)
-            else:
-                X_gat, times, y_gat, i_tr, i_val, i_te = \
-                    prepare_gat_ieee(df_s)
-                ei = build_ieee_graph_edges(df_s, max_per_card=100)
-            _adj_cache["gat"] = (X_gat, y_gat, i_tr, i_val, i_te, ei)
-        return _adj_cache["gat"]
+    # GAT data (lazy — only if needed)
+    gat_data = None
+    if any(a in algos for a in ["GNN (GATv2)", "GAT+XGB"]):
+        if cfg.name == "CC":
+            X_gat, X_pca, times, y_gat, i_tr_gat, i_val_gat, i_te_gat = prepare_gat_cc(df_s)
+            edge_index = build_cc_graph_cosine(X_pca, times=times, k=5, cos_dist_threshold=0.10)
+        else:
+            X_gat, times, y_gat, i_tr_gat, i_val_gat, i_te_gat = prepare_gat_ieee(df_s)
+            edge_index = build_ieee_graph_edges(df_s, max_per_card=100)
+        gat_data = (X_gat, y_gat, i_tr_gat, i_val_gat, i_te_gat, edge_index)
 
     # ── 4. XGBoost ─────────────────────────────────────────────────────────────
     if "XGBoost" in algos:
@@ -167,7 +176,7 @@ def run_dataset(name, df, label_col, num_feats, cat_feats,
         scores = det.score(Xg_te)
         metrics = compute_metrics(yg_te, scores)
         results.append(dict(
-            name="XGBoost", dataset=name,
+            name="XGBoost", dataset=cfg.name,
             y_test=yg_te, scores=scores,
             train_time=det.train_time,
             **metrics,
@@ -183,7 +192,7 @@ def run_dataset(name, df, label_col, num_feats, cat_feats,
         scores = det.score(X_te)
         metrics = compute_metrics(y_te, scores)
         results.append(dict(
-            name="Isolation Forest", dataset=name,
+            name="Isolation Forest", dataset=cfg.name,
             y_test=y_te, scores=scores,
             train_time=det.train_time,
             **metrics,
@@ -199,7 +208,7 @@ def run_dataset(name, df, label_col, num_feats, cat_feats,
         scores = det.score(X_te)
         metrics = compute_metrics(y_te, scores)
         results.append(dict(
-            name="Autoencoder", dataset=name,
+            name="Autoencoder", dataset=cfg.name,
             y_test=y_te, scores=scores,
             train_time=det.train_time,
             **metrics,
@@ -210,16 +219,12 @@ def run_dataset(name, df, label_col, num_feats, cat_feats,
     # ── 7. GATv2 (SOTA — indutivo, split cronológico, grafo causal) ───────────
     if "GNN (GATv2)" in algos:
         print("\n  [GNN (GATv2)]")
-        X_gat, y_gat, i_tr_gat, i_val_gat, i_te_gat, edge_index = \
-            get_gat_data()
+        X_gat, y_gat, i_tr_gat, i_val_gat, i_te_gat, edge_index = gat_data
 
         N_gat = len(y_gat)
-        train_mask_gat = np.zeros(N_gat, dtype=bool)
-        val_mask_gat   = np.zeros(N_gat, dtype=bool)
-        test_mask_gat  = np.zeros(N_gat, dtype=bool)
-        train_mask_gat[i_tr_gat]  = True
-        val_mask_gat[i_val_gat]   = True
-        test_mask_gat[i_te_gat]   = True
+        train_mask_gat, val_mask_gat, test_mask_gat = _build_masks(
+            N_gat, i_tr_gat, i_te_gat, i_val_gat
+        )
 
         det = GATDetector(seed=seed)
         det.fit(X_gat, y_gat, train_mask_gat, test_mask_gat, edge_index,
@@ -229,7 +234,7 @@ def run_dataset(name, df, label_col, num_feats, cat_feats,
         y_te_gat    = y_gat[i_te_gat]
         metrics     = compute_metrics(y_te_gat, scores)
         results.append(dict(
-            name="GNN (GATv2)", dataset=name,
+            name="GNN (GATv2)", dataset=cfg.name,
             y_test=y_te_gat, scores=scores,
             train_time=det.train_time,
             **metrics,
@@ -240,19 +245,15 @@ def run_dataset(name, df, label_col, num_feats, cat_feats,
     # ── 7.5. GAT+XGB ───────────────────────────────────────────────────────────
     if "GAT+XGB" in algos:
         print("\n  [GAT+XGB]")
-        X_gat, y_gat, i_tr_gat, i_val_gat, i_te_gat, edge_index = \
-            get_gat_data()
+        X_gat, y_gat, i_tr_gat, i_val_gat, i_te_gat, edge_index = gat_data
 
         N_gat = len(y_gat)
-        train_mask_gat = np.zeros(N_gat, dtype=bool)
-        val_mask_gat   = np.zeros(N_gat, dtype=bool)
-        test_mask_gat  = np.zeros(N_gat, dtype=bool)
-        train_mask_gat[i_tr_gat]  = True
-        val_mask_gat[i_val_gat]   = True
-        test_mask_gat[i_te_gat]   = True
+        train_mask_gat, val_mask_gat, test_mask_gat = _build_masks(
+            N_gat, i_tr_gat, i_te_gat, i_val_gat
+        )
 
         # Features tabulares alinhadas ao split cronológico do GAT
-        Xg_all_xgb, _ = prepare_xgboost_all(df_s, num_feats, cat_feats, label_col)
+        Xg_all_xgb, _ = prepare_xgboost_all(df_s, cfg.num_feats, cfg.cat_feats, cfg.label_col)
         Xg_gat_tr = Xg_all_xgb[i_tr_gat]
         yg_gat_tr  = y_gat[i_tr_gat]
         Xg_gat_te  = Xg_all_xgb[i_te_gat]
@@ -265,7 +266,7 @@ def run_dataset(name, df, label_col, num_feats, cat_feats,
         y_te_gat = y_gat[i_te_gat]
         metrics  = compute_metrics(y_te_gat, scores)
         results.append(dict(
-            name="GAT+XGB", dataset=name,
+            name="GAT+XGB", dataset=cfg.name,
             y_test=y_te_gat, scores=scores,
             train_time=det.train_time,
             **metrics,
@@ -276,24 +277,19 @@ def run_dataset(name, df, label_col, num_feats, cat_feats,
     # ── 8. GNN (GCN) ───────────────────────────────────────────────────────────
     if "GNN (GCN)" in algos:
         print("  [GNN (GCN)]")
-        adj = get_adj()
         adj_norm = normalize_adj(adj)
 
         # Features completas (numéricas + categóricas) — mesma vantagem do XGBoost
-        X_gnn = prepare_gnn(df_s, num_feats, cat_feats, label_col)
+        X_gnn = prepare_gnn(df_s, cfg.num_feats, cfg.cat_feats, cfg.label_col)
 
-        N = len(y_all)
-        train_mask = np.zeros(N, dtype=bool)
-        test_mask  = np.zeros(N, dtype=bool)
-        train_mask[idx_tr] = True
-        test_mask[idx_te]  = True
+        train_mask, test_mask = _build_masks(len(y_all), idx_tr, idx_te)
 
         det = GNNDetector(seed=seed)
         det.fit(X_gnn, y_all, train_mask, test_mask, adj_norm)
         scores = det.score()
         metrics = compute_metrics(y_te, scores)
         results.append(dict(
-            name="GNN (GCN)", dataset=name,
+            name="GNN (GCN)", dataset=cfg.name,
             y_test=y_te, scores=scores,
             train_time=det.train_time,
             **metrics,
@@ -304,22 +300,16 @@ def run_dataset(name, df, label_col, num_feats, cat_feats,
     # ── 8. GraphSAGE+XGB ───────────────────────────────────────────────────────
     if "GraphSAGE+XGB" in algos:
         print("\n  [GraphSAGE+XGB]")
-        adj = get_adj()
+        X_gnn = prepare_gnn(df_s, cfg.num_feats, cfg.cat_feats, cfg.label_col)
 
-        X_gnn = prepare_gnn(df_s, num_feats, cat_feats, label_col)
-
-        N = len(y_all)
-        train_mask = np.zeros(N, dtype=bool)
-        test_mask  = np.zeros(N, dtype=bool)
-        train_mask[idx_tr] = True
-        test_mask[idx_te]  = True
+        train_mask, test_mask = _build_masks(len(y_all), idx_tr, idx_te)
 
         det = GraphSAGEXGBDetector(seed=seed)
         det.fit(X_gnn, y_all, train_mask, test_mask, adj, Xg_tr, yg_tr)
         scores = det.score(Xg_te)
         metrics = compute_metrics(yg_te, scores)
         results.append(dict(
-            name="GraphSAGE+XGB", dataset=name,
+            name="GraphSAGE+XGB", dataset=cfg.name,
             y_test=yg_te, scores=scores,
             train_time=det.train_time,
             **metrics,
@@ -335,7 +325,7 @@ def run_dataset(name, df, label_col, num_feats, cat_feats,
         scores = det.score(Xg_te)
         metrics = compute_metrics(yg_te, scores)
         results.append(dict(
-            name="LightGBM", dataset=name,
+            name="LightGBM", dataset=cfg.name,
             y_test=yg_te, scores=scores,
             train_time=det.train_time,
             **metrics,
@@ -351,7 +341,7 @@ def run_dataset(name, df, label_col, num_feats, cat_feats,
         scores = det.score(Xg_te)
         metrics = compute_metrics(yg_te, scores)
         results.append(dict(
-            name="CatBoost", dataset=name,
+            name="CatBoost", dataset=cfg.name,
             y_test=yg_te, scores=scores,
             train_time=det.train_time,
             **metrics,
@@ -367,7 +357,7 @@ def run_dataset(name, df, label_col, num_feats, cat_feats,
         scores = det.score(Xg_te)
         metrics = compute_metrics(yg_te, scores)
         results.append(dict(
-            name="TabNet", dataset=name,
+            name="TabNet", dataset=cfg.name,
             y_test=yg_te, scores=scores,
             train_time=det.train_time,
             **metrics,
@@ -383,7 +373,7 @@ def run_dataset(name, df, label_col, num_feats, cat_feats,
         scores = det.score(Xg_te)
         metrics = compute_metrics(yg_te, scores)
         results.append(dict(
-            name="Stacking", dataset=name,
+            name="Stacking", dataset=cfg.name,
             y_test=yg_te, scores=scores,
             train_time=det.train_time,
             **metrics,
@@ -522,32 +512,14 @@ def main():
     if "CC" in datasets:
         def cc_graph(X_all, df_s):
             return build_cc_graph(X_all, k=10)
-
-        cc_results = run_dataset(
-            name="CC",
-            df=cc_df,
-            label_col="Class",
-            num_feats=CC_NUM_FEATS,
-            cat_feats=[],
-            graph_builder=cc_graph,
-            algos=algos,
-        )
+        cc_results = run_dataset(CC_CONFIG, cc_df, cc_graph, algos=algos)
         all_results.extend(cc_results)
 
     # ── IEEE ───────────────────────────────────────────────────────────────────
     if "IEEE" in datasets:
         def ieee_graph(X_all, df_s):
             return build_ieee_graph(df_s, max_per_card=100)
-
-        ieee_results = run_dataset(
-            name="IEEE",
-            df=ieee_df,
-            label_col="isFraud",
-            num_feats=IEEE_NUM_FEATS,
-            cat_feats=IEEE_CAT_FEATS,
-            graph_builder=ieee_graph,
-            algos=algos,
-        )
+        ieee_results = run_dataset(IEEE_CONFIG, ieee_df, ieee_graph, algos=algos)
         all_results.extend(ieee_results)
 
     # ── Relatórios ─────────────────────────────────────────────────────────────

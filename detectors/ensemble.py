@@ -8,13 +8,14 @@ warnings.filterwarnings("ignore")
 
 import numpy as np
 from sklearn.ensemble import IsolationForest
+from detectors.base import BaseDetector
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 2. IsolationForestDetector
 # ══════════════════════════════════════════════════════════════════════════════
 
-class IsolationForestDetector:
+class IsolationForestDetector(BaseDetector):
     name = "Isolation Forest"
 
     def __init__(self, n_estimators=100, seed=42):
@@ -43,7 +44,7 @@ class IsolationForestDetector:
 # 10. StackingDetector  (XGBoost + LightGBM + CatBoost + LR  →  meta-LR)
 # ══════════════════════════════════════════════════════════════════════════════
 
-class StackingDetector:
+class StackingDetector(BaseDetector):
     name = "Stacking"
 
     def __init__(self, n_folds=5, seed=42):

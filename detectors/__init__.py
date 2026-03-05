@@ -5,6 +5,7 @@ Re-exports all public names to preserve the existing import interface:
     from detectors import XGBoostDetector, GNNDetector, ...
 """
 
+from detectors.base import BaseDetector
 from detectors.tree_based import XGBoostDetector, LightGBMDetector, CatBoostDetector
 from detectors.neural import AutoencoderDetector, TabNetDetector
 from detectors.graph import (
@@ -21,6 +22,7 @@ from detectors.graph import (
 from detectors.ensemble import IsolationForestDetector, StackingDetector
 
 __all__ = [
+    "BaseDetector",
     "XGBoostDetector",
     "LightGBMDetector",
     "CatBoostDetector",

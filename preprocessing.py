@@ -9,6 +9,7 @@ warnings.filterwarnings("ignore")
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from dataclasses import dataclass, field
 from sklearn.model_selection import train_test_split
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler, RobustScaler, OrdinalEncoder
@@ -17,7 +18,9 @@ from sklearn.preprocessing import StandardScaler, RobustScaler, OrdinalEncoder
 BASE      = Path(__file__).parent
 CC_PATH   = BASE / "Credit Card Fraud Detection" / "creditcard.csv"
 IEEE_TXN  = BASE / "ieee-fraud-detection" / "train_transaction.csv"
-IEEE_ID   = BASE / "ieee-fraud-detection" / "train_identity.csv"
+IEEE_ID           = BASE / "ieee-fraud-detection" / "train_identity.csv"
+PLOTS_DIR         = BASE / "plots"
+PLOTS_RESULTS_DIR = BASE / "plots" / "results"
 
 # ── Feature lists ──────────────────────────────────────────────────────────────
 CC_NUM_FEATS = [f"V{i}" for i in range(1, 29)] + ["Amount"]
@@ -30,6 +33,30 @@ IEEE_NUM_FEATS = (
 )
 
 IEEE_CAT_FEATS = ["ProductCD", "card4", "card6", "P_emaildomain", "R_emaildomain"]
+
+# ── Dataset configurations ──────────────────────────────────────────────────
+@dataclass(frozen=True)
+class DatasetConfig:
+    name:      str
+    label_col: str
+    time_col:  str
+    num_feats: list
+    cat_feats: list = field(default_factory=list)
+
+CC_CONFIG = DatasetConfig(
+    name="CC",
+    label_col="Class",
+    time_col="Time",
+    num_feats=CC_NUM_FEATS,
+)
+
+IEEE_CONFIG = DatasetConfig(
+    name="IEEE",
+    label_col="isFraud",
+    time_col="TransactionDT",
+    num_feats=IEEE_NUM_FEATS,
+    cat_feats=IEEE_CAT_FEATS,
+)
 
 
 # ── Functions ──────────────────────────────────────────────────────────────────
@@ -62,7 +89,21 @@ def sample_stratified(df, label_col, n, seed=42):
     return sampled.reset_index(drop=True)
 
 
-def prepare_numeric(df, feat_cols, label_col, seed=42):
+def make_chronological_split(df, time_col):
+    """
+    Split cronológico 70/15/15. Retorna (idx_tr, idx_val, idx_te)
+    como arrays de índices posicionais sobre df reset_index(drop=True).
+    """
+    times   = df[time_col].values.astype(np.float64) if time_col in df.columns \
+              else np.arange(len(df), dtype=np.float64)
+    chrono  = np.argsort(times, kind="stable")
+    N       = len(df)
+    tr_end  = int(N * 0.70)
+    val_end = int(N * 0.85)
+    return chrono[:tr_end], chrono[tr_end:val_end], chrono[val_end:]
+
+
+def prepare_numeric(df, feat_cols, label_col, idx_tr, idx_te, seed=42):
     """
     Imputa mediana, aplica StandardScaler, faz split treino/teste.
 
@@ -86,15 +127,6 @@ def prepare_numeric(df, feat_cols, label_col, seed=42):
 
     scaler = StandardScaler()
     X_all = scaler.fit_transform(X_imp)
-
-    # Split
-    idx = np.arange(len(y_all))
-    idx_tr, idx_te = train_test_split(
-        idx,
-        test_size=0.2,
-        stratify=y_all,
-        random_state=seed,
-    )
 
     X_tr, X_te = X_all[idx_tr], X_all[idx_te]
     y_tr, y_te = y_all[idx_tr], y_all[idx_te]
@@ -148,15 +180,9 @@ def prepare_gat_cc(df):
     """
     times = df["Time"].values.astype(np.float64)
     y_all = df["Class"].values.astype(int)
-    N     = len(df)
 
     # ── Split cronológico 70 / 15 / 15 ────────────────────────────────────────
-    chrono  = np.argsort(times, kind="stable")
-    tr_end  = int(N * 0.70)
-    val_end = int(N * 0.85)
-    idx_tr  = chrono[:tr_end]
-    idx_val = chrono[tr_end:val_end]
-    idx_te  = chrono[val_end:]
+    idx_tr, idx_val, idx_te = make_chronological_split(df, "Time")
 
     # ── V1-V28: StandardScaler ─────────────────────────────────────────────────
     pca_cols  = [f"V{i}" for i in range(1, 29)]
@@ -203,12 +229,7 @@ def prepare_gat_ieee(df):
     N     = len(df)
 
     # ── Split cronológico 70 / 15 / 15 ────────────────────────────────────────
-    chrono  = np.argsort(times, kind="stable")
-    tr_end  = int(N * 0.70)
-    val_end = int(N * 0.85)
-    idx_tr  = chrono[:tr_end]
-    idx_val = chrono[tr_end:val_end]
-    idx_te  = chrono[val_end:]
+    idx_tr, idx_val, idx_te = make_chronological_split(df, "TransactionDT")
 
     # ── Numéricas (exceto TransactionAmt) ─────────────────────────────────────
     num_feats  = (
@@ -253,7 +274,7 @@ def prepare_gat_ieee(df):
     return X_gat, times, y_all, idx_tr, idx_val, idx_te
 
 
-def prepare_xgboost(df, num_cols, cat_cols, label_col, seed=42):
+def prepare_xgboost(df, num_cols, cat_cols, label_col, idx_tr, idx_te, seed=42):
     """
     Prepara features para XGBoost: numéricas imputadas + categóricas com
     OrdinalEncoder. Retorna (X_tr, X_te, y_tr, y_te).
@@ -277,9 +298,8 @@ def prepare_xgboost(df, num_cols, cat_cols, label_col, seed=42):
     else:
         X = X_num
 
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X, y, test_size=0.2, stratify=y, random_state=seed
-    )
+    X_tr, X_te = X[idx_tr], X[idx_te]
+    y_tr, y_te = y[idx_tr], y[idx_te]
     return X_tr, X_te, y_tr, y_te
 
 
