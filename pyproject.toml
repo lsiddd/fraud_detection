@@ -18,6 +18,8 @@ dependencies = [
     "torch-geometric>=2.7.0",
     "faiss-cpu>=1.7",
     "autogluon>=1.5.0",
+    "skorch>=0.11",
+    "ipython>=8.38.0",
 ]
 
 [project.scripts]

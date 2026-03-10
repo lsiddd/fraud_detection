@@ -114,7 +114,8 @@ def _build_masks(N, idx_tr, idx_te, idx_val=None):
 
 
 def run_dataset(cfg: DatasetConfig, df, graph_builder, algos=None, seed=SEED,
-                ag_time_limit=600, ag_presets="best_quality"):
+                ag_time_limit=600, ag_presets="best_quality",
+                ag_bag_folds=0, ag_stack_levels=0, ag_include_nn=False):
     """
     Treina e avalia os 4 detectores em um dataset completo.
     Retorna lista de result dicts.
@@ -367,7 +368,11 @@ def run_dataset(cfg: DatasetConfig, df, graph_builder, algos=None, seed=SEED,
     # ── 11. AutoGluon ──────────────────────────────────────────────────────────
     if "AutoGluon" in algos:
         print("  [AutoGluon]")
-        det = AutoGluonDetector(time_limit=ag_time_limit, presets=ag_presets, seed=seed)
+        det = AutoGluonDetector(
+            time_limit=ag_time_limit, presets=ag_presets,
+            num_bag_folds=ag_bag_folds, num_stack_levels=ag_stack_levels,
+            include_nn=ag_include_nn, seed=seed,
+        )
         det.fit(Xg_tr, yg_tr)
         scores = det.score(Xg_te)
         metrics = compute_metrics(yg_te, scores)
@@ -551,6 +556,35 @@ def parse_args():
         help="Preset do AutoGluon: best_quality | high_quality | medium_quality (padrão: best_quality).",
     )
     parser.add_argument(
+        "--ag-bag-folds",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Número de folds de bagging (padrão: 0 = sem bagging).\n"
+            "Os folds são treinados sequencialmente (pico de RAM = 1 fold).\n"
+            "Recomendado: 8 para máxima acurácia sem estourar memória."
+        ),
+    )
+    parser.add_argument(
+        "--ag-stack-levels",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Níveis de stacking (padrão: 0 = sem stacking).\n"
+            "Requer --ag-bag-folds >= 2. Aumenta acurácia mas usa mais RAM."
+        ),
+    )
+    parser.add_argument(
+        "--ag-include-nn",
+        action="store_true",
+        help=(
+            "Inclui modelos neurais no AutoGluon (NeuralNetTorch e NeuralNetFastAI).\n"
+            "Requer skorch instalado (já incluso no pyproject.toml)."
+        ),
+    )
+    parser.add_argument(
         "--no-plots",
         action="store_true",
         help="Não gera os gráficos ao final.",
@@ -594,7 +628,13 @@ def main():
     all_results = []
 
     # ── CC ─────────────────────────────────────────────────────────────────────
-    ag_kwargs = dict(ag_time_limit=args.ag_time_limit, ag_presets=args.ag_presets)
+    ag_kwargs = dict(
+        ag_time_limit=args.ag_time_limit,
+        ag_presets=args.ag_presets,
+        ag_bag_folds=args.ag_bag_folds,
+        ag_stack_levels=args.ag_stack_levels,
+        ag_include_nn=args.ag_include_nn,
+    )
 
     if "CC" in datasets:
         def cc_graph(X_all, df_s):

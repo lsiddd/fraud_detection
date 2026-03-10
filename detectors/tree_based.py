@@ -181,14 +181,19 @@ class CatBoostDetector(BaseDetector):
 class AutoGluonDetector(BaseDetector):
     name = "AutoGluon"
 
-    # Models to exclude: neural nets crash Ray workers with OOM on large datasets
-    _EXCLUDED_MODELS = ["NeuralNetFastAI", "NeuralNetTorch"]
+    # AutoGluon 1.5 type strings for neural net models
+    _NN_MODELS = ["NN_TORCH", "FASTAI"]
 
     def __init__(self, time_limit=600, presets="best_quality",
-                 eval_metric="average_precision", seed=42):
+                 eval_metric="average_precision",
+                 num_bag_folds=0, num_stack_levels=0,
+                 include_nn=False, seed=42):
         self.time_limit = time_limit
         self.presets = presets
         self.eval_metric = eval_metric
+        self.num_bag_folds = num_bag_folds
+        self.num_stack_levels = num_stack_levels
+        self.include_nn = include_nn
         self.seed = seed
         self.train_time = 0.0
         self._predictor = None
@@ -224,8 +229,18 @@ class AutoGluonDetector(BaseDetector):
         df_tr = self._to_df(X_tr)
         df_tr["label"] = y_tr
 
+        excluded = [] if self.include_nn else list(self._NN_MODELS)
         print(f"    time_limit={self.time_limit}s | presets={self.presets}"
-              f" | eval_metric={self.eval_metric}")
+              f" | eval_metric={self.eval_metric}"
+              f" | bag_folds={self.num_bag_folds} | stack_levels={self.num_stack_levels}"
+              f" | nn={'on' if self.include_nn else 'off'}")
+
+        # Treina folds sequencialmente para que o pico de memória seja igual
+        # a um único fold, mesmo com bagging habilitado.
+        ag_args_ensemble = (
+            {"fold_fitting_strategy": "sequential_local"}
+            if self.num_bag_folds > 0 else {}
+        )
 
         self._tmpdir = tempfile.mkdtemp(prefix="autogluon_fraud_")
         t0 = time.time()
@@ -238,21 +253,55 @@ class AutoGluonDetector(BaseDetector):
             df_tr,
             time_limit=self.time_limit,
             presets=self.presets,
-            excluded_model_types=self._EXCLUDED_MODELS,
+            num_bag_folds=self.num_bag_folds,
+            num_stack_levels=self.num_stack_levels,
+            excluded_model_types=excluded,
             ag_args_fit={"random_seed": self.seed},
+            ag_args_ensemble=ag_args_ensemble,
         )
         self.train_time = time.time() - t0
 
-        # Mostra leaderboard com modelo vencedor e métricas de validação
         lb = self._predictor.leaderboard(silent=True)
+        self._print_detail(lb)
+        print(f"    Concluído em {self.train_time:.1f}s\n")
+        return self
+
+    def _print_detail(self, lb):
+        """Leaderboard + composição do ensemble vencedor + hiperparâmetros dos top modelos."""
         cols = [c for c in ["model", "score_val", "fit_time", "pred_time_val"] if c in lb.columns]
         print(f"\n    === Leaderboard AutoGluon (top 10) ===")
         print(lb[cols].head(10).to_string(index=False))
+
         best = lb["model"].iloc[0]
         best_score = lb["score_val"].iloc[0]
         print(f"    Modelo vencedor: {best}  (val {self.eval_metric}={best_score:.4f})")
-        print(f"    Concluído em {self.train_time:.1f}s\n")
-        return self
+
+        info = self._predictor.info()
+        model_info = info.get("model_info", {})
+
+        # Composição do ensemble (pesos por modelo-base)
+        if "WeightedEnsemble" in best:
+            hp_fit = model_info.get(best, {}).get("hyperparameters_fit", {})
+            weights = hp_fit.get("weights", {})
+            if weights:
+                print(f"\n    === Composição do {best} ===")
+                for m, w in sorted(weights.items(), key=lambda x: -x[1]):
+                    score = lb.set_index("model")["score_val"].get(m, float("nan"))
+                    print(f"      {m:<35} peso={w:.4f}  val={score:.4f}")
+
+        # Hiperparâmetros dos top-5 modelos não-ensemble
+        top5 = [m for m in lb["model"].tolist() if "WeightedEnsemble" not in m][:5]
+        if top5:
+            print(f"\n    === Hiperparâmetros (top 5 modelos) ===")
+        for model_name in top5:
+            minfo = model_info.get(model_name, {})
+            # hyperparameters_fit contém os valores reais usados no treino
+            hp = minfo.get("hyperparameters_fit") or minfo.get("hyperparameters") or {}
+            if not hp:
+                continue
+            print(f"\n    [{model_name}]")
+            for k, v in list(hp.items())[:15]:
+                print(f"      {k}: {v}")
 
     def score(self, X_te):
         proba = self._predictor.predict_proba(self._to_df(X_te), as_multiclass=False)
