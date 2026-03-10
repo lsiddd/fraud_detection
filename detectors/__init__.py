@@ -6,7 +6,7 @@ Re-exports all public names to preserve the existing import interface:
 """
 
 from detectors.base import BaseDetector
-from detectors.tree_based import XGBoostDetector, LightGBMDetector, CatBoostDetector
+from detectors.tree_based import XGBoostDetector, LightGBMDetector, CatBoostDetector, AutoGluonDetector
 from detectors.neural import AutoencoderDetector, TabNetDetector
 from detectors.graph import (
     GATDetector,
@@ -19,13 +19,14 @@ from detectors.graph import (
     build_ieee_graph_edges,
     normalize_adj,
 )
-from detectors.ensemble import IsolationForestDetector, StackingDetector
+from detectors.ensemble import IsolationForestDetector, StackingDetector, SuperEnsembleDetector
 
 __all__ = [
     "BaseDetector",
     "XGBoostDetector",
     "LightGBMDetector",
     "CatBoostDetector",
+    "AutoGluonDetector",
     "AutoencoderDetector",
     "TabNetDetector",
     "GATDetector",
@@ -39,4 +40,5 @@ __all__ = [
     "normalize_adj",
     "IsolationForestDetector",
     "StackingDetector",
+    "SuperEnsembleDetector",
 ]

@@ -1,5 +1,5 @@
 """
-tree_based.py — XGBoostDetector, LightGBMDetector, CatBoostDetector
+tree_based.py — XGBoostDetector, LightGBMDetector, CatBoostDetector, AutoGluonDetector
 """
 
 import time
@@ -172,3 +172,88 @@ class CatBoostDetector(BaseDetector):
 
     def score(self, X_te):
         return self._model.predict_proba(self._to_int_cats(X_te))[:, 1]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 9. AutoGluonDetector
+# ══════════════════════════════════════════════════════════════════════════════
+
+class AutoGluonDetector(BaseDetector):
+    name = "AutoGluon"
+
+    # Models to exclude: neural nets crash Ray workers with OOM on large datasets
+    _EXCLUDED_MODELS = ["NeuralNetFastAI", "NeuralNetTorch"]
+
+    def __init__(self, time_limit=600, presets="best_quality",
+                 eval_metric="average_precision", seed=42):
+        self.time_limit = time_limit
+        self.presets = presets
+        self.eval_metric = eval_metric
+        self.seed = seed
+        self.train_time = 0.0
+        self._predictor = None
+        self._columns = None
+
+    def _to_df(self, X):
+        import pandas as pd
+        return pd.DataFrame(X, columns=self._columns)
+
+    @staticmethod
+    def _init_ray():
+        """Pre-initialize Ray without runtime_env to prevent package redistribution crash."""
+        try:
+            import ray
+            if not ray.is_initialized():
+                ray.init(
+                    ignore_reinit_error=True,
+                    include_dashboard=False,
+                    log_to_driver=False,
+                    runtime_env={},  # empty = don't package the working directory
+                )
+        except Exception:
+            pass  # Ray unavailable; AutoGluon falls back to single-process
+
+    def fit(self, X_tr, y_tr):
+        import tempfile
+        import pandas as pd
+        from autogluon.tabular import TabularPredictor
+
+        self._init_ray()
+
+        self._columns = [f"f{i}" for i in range(X_tr.shape[1])]
+        df_tr = self._to_df(X_tr)
+        df_tr["label"] = y_tr
+
+        print(f"    time_limit={self.time_limit}s | presets={self.presets}"
+              f" | eval_metric={self.eval_metric}")
+
+        self._tmpdir = tempfile.mkdtemp(prefix="autogluon_fraud_")
+        t0 = time.time()
+        self._predictor = TabularPredictor(
+            label="label",
+            eval_metric=self.eval_metric,
+            path=self._tmpdir,
+            verbosity=1,
+        ).fit(
+            df_tr,
+            time_limit=self.time_limit,
+            presets=self.presets,
+            excluded_model_types=self._EXCLUDED_MODELS,
+            ag_args_fit={"random_seed": self.seed},
+        )
+        self.train_time = time.time() - t0
+
+        # Mostra leaderboard com modelo vencedor e métricas de validação
+        lb = self._predictor.leaderboard(silent=True)
+        cols = [c for c in ["model", "score_val", "fit_time", "pred_time_val"] if c in lb.columns]
+        print(f"\n    === Leaderboard AutoGluon (top 10) ===")
+        print(lb[cols].head(10).to_string(index=False))
+        best = lb["model"].iloc[0]
+        best_score = lb["score_val"].iloc[0]
+        print(f"    Modelo vencedor: {best}  (val {self.eval_metric}={best_score:.4f})")
+        print(f"    Concluído em {self.train_time:.1f}s\n")
+        return self
+
+    def score(self, X_te):
+        proba = self._predictor.predict_proba(self._to_df(X_te), as_multiclass=False)
+        return proba.values

@@ -30,6 +30,8 @@ from preprocessing import (
     prepare_gnn,
     prepare_gat_cc,
     prepare_gat_ieee,
+    prepare_ensemble_cc,
+    prepare_ensemble_ieee,
     CC_NUM_FEATS,
     IEEE_NUM_FEATS,
     IEEE_CAT_FEATS,
@@ -47,8 +49,10 @@ from detectors import (
     GraphSAGEXGBDetector,
     LightGBMDetector,
     CatBoostDetector,
+    AutoGluonDetector,
     TabNetDetector,
     StackingDetector,
+    SuperEnsembleDetector,
     build_cc_graph,
     build_cc_graph_cosine,
     build_ieee_graph,
@@ -109,7 +113,8 @@ def _build_masks(N, idx_tr, idx_te, idx_val=None):
     return train_mask, test_mask
 
 
-def run_dataset(cfg: DatasetConfig, df, graph_builder, algos=None, seed=SEED):
+def run_dataset(cfg: DatasetConfig, df, graph_builder, algos=None, seed=SEED,
+                ag_time_limit=600, ag_presets="best_quality"):
     """
     Treina e avalia os 4 detectores em um dataset completo.
     Retorna lista de result dicts.
@@ -137,6 +142,16 @@ def run_dataset(cfg: DatasetConfig, df, graph_builder, algos=None, seed=SEED):
         df_s, cfg.num_feats, cfg.cat_feats, cfg.label_col, idx_tr=idx_tr, idx_te=idx_te, seed=seed
     )
 
+    # ── 3b. Preparação enriquecida para Super Ensemble (lazy) ─────────────────
+    super_data = None
+    if "Super Ensemble" in algos:
+        if cfg.name == "CC":
+            Xs_tr, Xs_te, ys_tr, ys_te = prepare_ensemble_cc(df_s, idx_tr, idx_te)
+        else:
+            Xs_tr, Xs_te, ys_tr, ys_te = prepare_ensemble_ieee(df_s, idx_tr, idx_te)
+        super_data = (Xs_tr, Xs_te, ys_tr, ys_te)
+        print(f"  Features Super Ensemble: {Xs_tr.shape[1]}")
+
     # Índices e cardinalidades das features categóricas (CatBoost e TabNet)
     _avail_num = [c for c in cfg.num_feats if c in df_s.columns]
     _avail_cat = [c for c in cfg.cat_feats if c in df_s.columns]
@@ -147,7 +162,7 @@ def run_dataset(cfg: DatasetConfig, df, graph_builder, algos=None, seed=SEED):
         algos = [
             "XGBoost", "Isolation Forest", "Autoencoder",
             "GNN (GATv2)", "GAT+XGB", "GNN (GCN)",
-            "GraphSAGE+XGB", "LightGBM", "CatBoost", "TabNet", "Stacking",
+            "GraphSAGE+XGB", "LightGBM", "CatBoost", "AutoGluon", "TabNet", "Stacking",
         ]
 
     results = []
@@ -349,7 +364,23 @@ def run_dataset(cfg: DatasetConfig, df, graph_builder, algos=None, seed=SEED):
         print(f"    ROC-AUC={metrics['roc_auc']:.4f}  PR-AUC={metrics['pr_auc']:.4f}"
               f"  F1={metrics['f1']:.4f}  t={det.train_time:.1f}s")
 
-    # ── 11. TabNet ─────────────────────────────────────────────────────────────
+    # ── 11. AutoGluon ──────────────────────────────────────────────────────────
+    if "AutoGluon" in algos:
+        print("  [AutoGluon]")
+        det = AutoGluonDetector(time_limit=ag_time_limit, presets=ag_presets, seed=seed)
+        det.fit(Xg_tr, yg_tr)
+        scores = det.score(Xg_te)
+        metrics = compute_metrics(yg_te, scores)
+        results.append(dict(
+            name="AutoGluon", dataset=cfg.name,
+            y_test=yg_te, scores=scores,
+            train_time=det.train_time,
+            **metrics,
+        ))
+        print(f"    ROC-AUC={metrics['roc_auc']:.4f}  PR-AUC={metrics['pr_auc']:.4f}"
+              f"  F1={metrics['f1']:.4f}  t={det.train_time:.1f}s")
+
+    # ── 12. TabNet ─────────────────────────────────────────────────────────────
     if "TabNet" in algos:
         print("  [TabNet]")
         det = TabNetDetector(seed=seed)
@@ -365,7 +396,7 @@ def run_dataset(cfg: DatasetConfig, df, graph_builder, algos=None, seed=SEED):
         print(f"    ROC-AUC={metrics['roc_auc']:.4f}  PR-AUC={metrics['pr_auc']:.4f}"
               f"  F1={metrics['f1']:.4f}  t={det.train_time:.1f}s")
 
-    # ── 12. Stacking ───────────────────────────────────────────────────────────
+    # ── 13. Stacking ───────────────────────────────────────────────────────────
     if "Stacking" in algos:
         print("  [Stacking]")
         det = StackingDetector(seed=seed)
@@ -375,6 +406,23 @@ def run_dataset(cfg: DatasetConfig, df, graph_builder, algos=None, seed=SEED):
         results.append(dict(
             name="Stacking", dataset=cfg.name,
             y_test=yg_te, scores=scores,
+            train_time=det.train_time,
+            **metrics,
+        ))
+        print(f"    ROC-AUC={metrics['roc_auc']:.4f}  PR-AUC={metrics['pr_auc']:.4f}"
+              f"  F1={metrics['f1']:.4f}  t={det.train_time:.1f}s")
+
+    # ── 14. Super Ensemble ─────────────────────────────────────────────────────
+    if "Super Ensemble" in algos:
+        print("\n  [Super Ensemble]")
+        Xs_tr, Xs_te, ys_tr, ys_te = super_data
+        det = SuperEnsembleDetector(seed=seed)
+        det.fit(Xs_tr, ys_tr)
+        scores = det.score(Xs_te)
+        metrics = compute_metrics(ys_te, scores)
+        results.append(dict(
+            name="Super Ensemble", dataset=cfg.name,
+            y_test=ys_te, scores=scores,
             train_time=det.train_time,
             **metrics,
         ))
@@ -408,7 +456,7 @@ def print_summary(all_results):
     print(sep)
 
 
-TREE_ALGOS = ["XGBoost", "LightGBM", "CatBoost", "Isolation Forest", "Stacking"]
+TREE_ALGOS = ["XGBoost", "LightGBM", "CatBoost", "Isolation Forest", "Stacking", "Super Ensemble"]
 DL_GRAPH_ALGOS = ["Autoencoder", "TabNet", "GNN (GATv2)", "GAT+XGB", "GNN (GCN)", "GraphSAGE+XGB"]
 
 ALGO_ALIASES = {
@@ -433,10 +481,15 @@ ALGO_ALIASES = {
     "lightgbm":  "LightGBM",
     "cat":       "CatBoost",
     "catboost":  "CatBoost",
+    "ag":        "AutoGluon",
+    "autogluon": "AutoGluon",
     "tabnet":    "TabNet",
     "tab":       "TabNet",
-    "stack":     "Stacking",
-    "stacking":  "Stacking",
+    "stack":          "Stacking",
+    "stacking":       "Stacking",
+    "se":             "Super Ensemble",
+    "super":          "Super Ensemble",
+    "superensemble":  "Super Ensemble",
 }
 
 DATASET_ALIASES = {
@@ -461,7 +514,7 @@ def parse_args():
             "Algoritmo(s) a executar (padrão: todos).\n"
             "Opções: xgb/xgboost | if/iso | ae/auto\n"
             "        gat/gatv2 | gatxgb/gat+xgb | gnn/gcn | sage/sagexgb/graphsage\n"
-            "        lgb/lgbm/lightgbm | cat/catboost\n"
+            "        lgb/lgbm/lightgbm | cat/catboost | ag/autogluon\n"
             "        tab/tabnet | stack/stacking"
         ),
     )
@@ -483,6 +536,19 @@ def parse_args():
             "Dataset(s) a usar (padrão: ambos).\n"
             "Opções: cc | ieee"
         ),
+    )
+    parser.add_argument(
+        "--ag-time-limit",
+        type=int,
+        default=600,
+        metavar="SEGUNDOS",
+        help="Time limit (s) para o AutoGluon (padrão: 600).",
+    )
+    parser.add_argument(
+        "--ag-presets",
+        default="best_quality",
+        metavar="PRESET",
+        help="Preset do AutoGluon: best_quality | high_quality | medium_quality (padrão: best_quality).",
     )
     parser.add_argument(
         "--no-plots",
@@ -528,17 +594,19 @@ def main():
     all_results = []
 
     # ── CC ─────────────────────────────────────────────────────────────────────
+    ag_kwargs = dict(ag_time_limit=args.ag_time_limit, ag_presets=args.ag_presets)
+
     if "CC" in datasets:
         def cc_graph(X_all, df_s):
             return build_cc_graph(X_all, k=10)
-        cc_results = run_dataset(CC_CONFIG, cc_df, cc_graph, algos=algos)
+        cc_results = run_dataset(CC_CONFIG, cc_df, cc_graph, algos=algos, **ag_kwargs)
         all_results.extend(cc_results)
 
     # ── IEEE ───────────────────────────────────────────────────────────────────
     if "IEEE" in datasets:
         def ieee_graph(X_all, df_s):
             return build_ieee_graph(df_s, max_per_card=100)
-        ieee_results = run_dataset(IEEE_CONFIG, ieee_df, ieee_graph, algos=algos)
+        ieee_results = run_dataset(IEEE_CONFIG, ieee_df, ieee_graph, algos=algos, **ag_kwargs)
         all_results.extend(ieee_results)
 
     # ── Relatórios ─────────────────────────────────────────────────────────────

@@ -13,11 +13,10 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from pathlib import Path
 from sklearn.metrics import roc_curve, precision_recall_curve, confusion_matrix
+from preprocessing import PLOTS_RESULTS_DIR
 
-BASE    = Path(__file__).parent
-OUT_DIR = BASE / "plots" / "results"
+OUT_DIR = PLOTS_RESULTS_DIR
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 ALGO_COLORS = {

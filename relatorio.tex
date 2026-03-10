@@ -1,0 +1,819 @@
+% ============================================================
+%  Relatório: Detecção de Fraudes em Transações Financeiras
+%  Métodos Baseados em Árvores
+% ============================================================
+\documentclass[12pt,a4paper]{article}
+
+% ── Pacotes ──────────────────────────────────────────────────────────────────
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[brazil]{babel}
+\usepackage{geometry}
+\geometry{margin=2.5cm}
+
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{hyperref}
+\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue}
+\usepackage{xcolor}
+\usepackage{microtype}
+\usepackage{enumitem}
+\usepackage{array}
+\usepackage{siunitx}
+\sisetup{group-separator={.}, group-minimum-digits=4}
+
+% ── Macros ───────────────────────────────────────────────────────────────────
+\newcommand{\dataset}[1]{\textsc{#1}}
+\newcommand{\algo}[1]{\textit{#1}}
+\newcommand{\metric}[1]{\texttt{#1}}
+
+% ── Metadados ────────────────────────────────────────────────────────────────
+\title{%
+  \textbf{Detecção de Fraudes em Transações Financeiras}\\[6pt]
+  \large Comparação de Métodos Baseados em Árvores de Decisão
+}
+\author{Lucas Pacheco}
+\date{Março de 2026}
+
+% ═════════════════════════════════════════════════════════════════════════════
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+% ─────────────────────────────────────────────────────────────────────────────
+\begin{abstract}
+Este relatório apresenta um estudo comparativo de seis métodos de detecção de
+fraudes em transações financeiras, todos pertencentes à família de métodos
+baseados em árvores de decisão: \algo{XGBoost}, \algo{LightGBM},
+\algo{CatBoost}, \algo{Isolation Forest}, \algo{Stacking} e
+\algo{Super Ensemble}. Os experimentos foram conduzidos em dois \textit{benchmarks}
+amplamente utilizados na literatura — o dataset \dataset{Credit Card Fraud
+Detection} (CC) e o \dataset{IEEE-CIS Fraud Detection} (IEEE) — que diferem
+substancialmente em dimensionalidade, taxa de fraude e tipo de features
+disponíveis. Os resultados evidenciam que métodos de \textit{gradient boosting}
+supervisionados (XGBoost, CatBoost) dominam na maioria das métricas, enquanto
+o \algo{Isolation Forest} — único método não supervisionado avaliado — apresenta
+ROC-AUC competitivo mas PR-AUC muito inferior, reflexo direto do desbalanceamento
+severo das classes. O \algo{Super Ensemble} obtém as melhores métricas no
+dataset IEEE (PR-AUC = 0{,}5095; F1 = 0{,}5255), ao custo de tempo de
+treinamento consideravelmente maior.
+\end{abstract}
+
+% =============================================================================
+\section{Introdução}
+\label{sec:intro}
+% =============================================================================
+
+A detecção de fraudes em pagamentos eletrônicos é um problema de classificação
+binária com características que tornam sua solução não trivial:
+
+\begin{itemize}[nosep]
+  \item \textbf{Desbalanceamento extremo de classes.} A proporção de transações
+    fraudulentas raramente ultrapassa 5\%, chegando a 0{,}17\% no dataset CC.
+    Métricas clássicas como acurácia tornam-se desinformativas, exigindo o uso
+    de ROC-AUC, PR-AUC, F1 e coeficiente de Matthews (MCC).
+
+  \item \textbf{Deriva temporal (\textit{concept drift}).} Padrões de fraude
+    evoluem continuamente; qualquer avaliação honesta deve respeitar a ordem
+    cronológica das transações — treinando apenas com o passado e testando no
+    futuro.
+
+  \item \textbf{Heterogeneidade das features.} Os datasets modernos combinam
+    variáveis numéricas contínuas, categóricas de alta cardinalidade, valores
+    ausentes sistemáticos e features derivadas (agregações, codificações
+    temporais).
+\end{itemize}
+
+Neste contexto, métodos baseados em \textit{gradient boosting} sobre árvores de
+decisão (\algo{XGBoost}~\cite{chen2016xgboost}, \algo{LightGBM}~\cite{ke2017lightgbm},
+\algo{CatBoost}~\cite{prokhorenkova2018catboost}) tornaram-se referência na
+prática e em competições de \textit{machine learning}, pois lidam nativamente
+com dados tabulares de alta dimensão, suportam valores ausentes, e possuem
+mecanismos embutidos de ponderação por classe para desbalanceamento.
+
+O objetivo deste trabalho é avaliar e comparar seis abordagens — incluindo um
+método de detecção de anomalias (\algo{Isolation Forest}) e dois métodos de
+ensemble de segundo nível (\algo{Stacking} e \algo{Super Ensemble}) — nos dois
+datasets citados, utilizando métricas e protocolo experimental padronizados.
+
+% =============================================================================
+\section{Datasets}
+\label{sec:datasets}
+% =============================================================================
+
+\subsection{Credit Card Fraud Detection (CC)}
+\label{sec:dataset-cc}
+
+O dataset \dataset{CC}~\cite{dal2015credit} foi disponibilizado pelo grupo de
+pesquisa ULB Machine Learning Group e contém transações realizadas com cartões
+de crédito europeus em setembro de 2013.
+
+\begin{itemize}[nosep]
+  \item \textbf{Dimensões:} \num{284807} transações $\times$ 31 colunas.
+  \item \textbf{Taxa de fraude:} 0{,}17\% (492 fraudes em \num{284315} transações
+    legítimas) — desbalanceamento severo de aproximadamente 1:578.
+  \item \textbf{Features:} 28 componentes principais obtidas via PCA (V1--V28,
+    anonimizadas para proteção de privacidade), o valor da transação (\texttt{Amount})
+    e o tempo em segundos desde a primeira transação do dataset (\texttt{Time}).
+\end{itemize}
+
+A transformação PCA prévia elimina a multicolinearidade e anonimiza os dados,
+mas também impede interpretação direta das features. O valor (\texttt{Amount})
+é a única variável em escala original; sua distribuição é fortemente assimétrica
+à direita, motivando transformações logarítmicas no pré-processamento do
+\algo{Super Ensemble}.
+
+\subsection{IEEE-CIS Fraud Detection (IEEE)}
+\label{sec:dataset-ieee}
+
+O dataset \dataset{IEEE}~\cite{ieee2019kaggle} foi disponibilizado pela Vesta
+Corporation em parceria com a IEEE Computational Intelligence Society via
+competição Kaggle (2019). É substancialmente mais complexo que o CC.
+
+\begin{itemize}[nosep]
+  \item \textbf{Dimensões:} \num{590540} transações $\times$ 434 colunas
+    (resultado da junção das tabelas \texttt{train\_transaction} e
+    \texttt{train\_identity} pela chave \texttt{TransactionID}).
+  \item \textbf{Taxa de fraude:} 3{,}50\% (\num{20663} fraudes).
+  \item \textbf{Features numéricas base:} valor da transação (\texttt{TransactionAmt}),
+    14 features de contagem de comportamento do cartão (C1--C14), 5 features de
+    distância temporal entre transações (D1--D5) e 20 features de identidade
+    anônimas (V1--V20).
+  \item \textbf{Features categóricas:} código do produto (\texttt{ProductCD}),
+    bandeira e tipo do cartão (\texttt{card4}, \texttt{card6}) e domínios de
+    e-mail do pagante e receptor (\texttt{P\_emaildomain}, \texttt{R\_emaildomain}).
+  \item \textbf{Features adicionais no Super Ensemble:} 339 colunas V adicionais
+    (filtradas por taxa de valores ausentes $<50\%$, resultando em 169 mantidas),
+    variáveis de endereço, distância, indicadores de ausência para D1--D15,
+    features de agregação por cartão e frequência de domínio de e-mail.
+\end{itemize}
+
+A Tabela~\ref{tab:datasets} resume as características principais de ambos os
+datasets.
+
+\begin{table}[H]
+  \centering
+  \caption{Características dos datasets utilizados nos experimentos.}
+  \label{tab:datasets}
+  \begin{tabular}{lrrrrr}
+    \toprule
+    \textbf{Dataset} & \textbf{Transações} & \textbf{Features} &
+    \textbf{Fraudes} & \textbf{Taxa} & \textbf{Treino / Teste} \\
+    \midrule
+    CC   & \num{284807} & 29 (numéricas) & 492     & 0{,}17\% &
+      \num{199364} / \num{42722} \\
+    IEEE & \num{590540} & 40 (base)      & \num{20663} & 3{,}50\% &
+      \num{413378} / \num{88581} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+% =============================================================================
+\section{Metodologia}
+\label{sec:metodologia}
+% =============================================================================
+
+\subsection{Protocolo de Divisão Treino/Teste}
+\label{sec:split}
+
+Para respeitar a causalidade temporal e evitar \textit{data leakage} de
+informação futura, todos os modelos utilizam uma \textbf{divisão cronológica}
+70\,/\,15\,/\,15 sobre a coluna de tempo de cada dataset (\texttt{Time} no CC
+e \texttt{TransactionDT} no IEEE). O procedimento consiste em:
+
+\begin{enumerate}[nosep]
+  \item Ordenar todas as transações pelo timestamp.
+  \item Atribuir os 70\% iniciais ao conjunto de \textbf{treino}.
+  \item Atribuir os 15\% seguintes à \textbf{validação} (usada internamente
+    por CatBoost e pelo early stopping dos demais modelos).
+  \item Atribuir os 15\% finais ao conjunto de \textbf{teste} (avaliação final).
+\end{enumerate}
+
+Essa abordagem simula fielmente o cenário de implantação real, onde o modelo
+aprende com transações passadas e é avaliado em transações futuras ainda não
+vistas.
+
+\subsection{Pré-processamento}
+\label{sec:preprocessing}
+
+O pré-processamento é diferenciado por família de método:
+
+\subsubsection{Pré-processamento Base (XGBoost, LightGBM, CatBoost, Stacking)}
+
+\begin{itemize}[nosep]
+  \item \textbf{Imputação:} valores ausentes substituídos pela mediana calculada
+    exclusivamente nos dados de treino (\texttt{SimpleImputer}).
+  \item \textbf{Features numéricas:} padronização com \texttt{StandardScaler}
+    (média 0, desvio 1) para o Isolation Forest; sem escalonamento para os
+    modelos de árvore, que são invariantes a transformações monotônicas.
+  \item \textbf{Features categóricas (IEEE):} codificação ordinal
+    (\texttt{OrdinalEncoder}) com valor $-1$ para categorias desconhecidas no
+    conjunto de teste; índices das colunas categóricas informados ao CatBoost
+    para tratamento nativo.
+  \item \textbf{Filtro de colunas V no IEEE:} das 339 colunas V disponíveis,
+    apenas as 169 com taxa de valores ausentes inferior a 50\% (calculada no
+    treino) são retidas, reduzindo ruído e custo computacional.
+\end{itemize}
+
+\subsubsection{Pré-processamento Enriquecido (Super Ensemble)}
+
+O Super Ensemble recebe um espaço de features expandido, construído sem
+\textit{data leakage} (todos os agregadores são ajustados exclusivamente no
+conjunto de treino):
+
+\paragraph{Dataset CC (40 features):}
+\begin{itemize}[nosep]
+  \item V1--V28 imputados pela mediana.
+  \item \textbf{Normas por transação:} $\ell_2$ das sub-sequências V1--V14,
+    V15--V28 e V1--V28 completo.
+  \item \textbf{Estatísticas por transação:} média, desvio padrão, máximo,
+    mínimo e contagem de valores negativos entre V1--V28.
+  \item \textbf{Amount:} log\,($1 + \text{Amount}$) e escalonamento robusto
+    (\texttt{RobustScaler}), que é insensível a outliers de fraude.
+  \item \textbf{Tempo cíclico:} $\sin(2\pi h/24)$ e $\cos(2\pi h/24)$, onde
+    $h$ é a hora do dia derivada de \texttt{Time}, capturando a periodicidade
+    circadiana sem descontinuidade.
+\end{itemize}
+
+\paragraph{Dataset IEEE (247 features):}
+Além de todas as features numéricas e categóricas expandidas:
+\begin{itemize}[nosep]
+  \item \textbf{Indicadores de ausência:} variáveis binárias para cada coluna
+    D1--D15, pois a ausência em si pode ser informativa (distância temporal não
+    registrada pode indicar primeira transação).
+  \item \textbf{Features de agregação por cartão (\texttt{card1}):} contagem de
+    transações, valor médio, desvio padrão e desvio normalizado do valor atual
+    em relação ao histórico do cartão.
+  \item \textbf{Features de agregação por endereço (\texttt{addr1}):} contagem
+    e valor médio das transações.
+  \item \textbf{Frequências de domínio de e-mail:} proporção de ocorrências de
+    cada domínio (\texttt{P\_emaildomain}, \texttt{R\_emaildomain}) no treino.
+  \item \textbf{Tempo cíclico e dia da semana:} codificação de \texttt{TransactionDT}
+    em $\sin/\cos$ da hora e posição no ciclo semanal.
+\end{itemize}
+
+\subsection{Métricas de Avaliação}
+\label{sec:metricas}
+
+Dado o severo desbalanceamento de classes, o desempenho é reportado por um
+conjunto amplo de métricas complementares:
+
+\begin{description}[style=nextline]
+  \item[\metric{ROC-AUC}]
+    Área sob a curva ROC. Mede a capacidade discriminativa geral do modelo
+    (probabilidade de ranquear uma fraude acima de uma transação legítima
+    aleatória). Insensível ao limiar de decisão mas pode ser otimista em
+    cenários de desbalanceamento extremo.
+
+  \item[\metric{PR-AUC} (Average Precision)]
+    Área sob a curva Precision-Recall. Foca no desempenho sobre a classe
+    minoritária e é mais informativa que ROC-AUC quando o desbalanceamento é
+    severo. Um classificador aleatório obteria PR-AUC $\approx$ taxa de fraude.
+
+  \item[\metric{Gini}]
+    $\text{Gini} = 2 \times \text{ROC-AUC} - 1$. Normalização da ROC-AUC no
+    intervalo $[-1, 1]$, amplamente usada no setor financeiro.
+
+  \item[\metric{KS} (Kolmogorov--Smirnov)]
+    Máxima separação entre as distribuições acumuladas dos scores de fraude e
+    de transações legítimas. Indica em que ponto do ranking o modelo melhor
+    discrimina as classes.
+
+  \item[\metric{MCC} (Matthews Correlation Coefficient)]
+    Correlação entre classes reais e preditas. Considerada a métrica mais
+    equilibrada para classificação binária desbalanceada, pois leva em conta
+    todos os quadrantes da matriz de confusão.
+
+  \item[\metric{F1}, \metric{Precision}, \metric{Recall}]
+    Calculados no limiar de decisão $\tau^*$ que maximiza o F1 sobre o conjunto
+    de teste — identificado via curva Precision-Recall discreta.
+
+  \item[\metric{FPR@90R}]
+    Taxa de falsos positivos (proporção de legítimas classificadas como fraude)
+    no ponto da curva ROC em que o recall (sensibilidade) é de 90\%. Métrica
+    operacional relevante: indica quantas transações legítimas precisam ser
+    bloqueadas para capturar 90\% das fraudes.
+\end{description}
+
+% =============================================================================
+\section{Métodos}
+\label{sec:metodos}
+% =============================================================================
+
+\subsection{XGBoost}
+\label{sec:xgboost}
+
+\algo{XGBoost}~\cite{chen2016xgboost} (\textit{eXtreme Gradient Boosting}) é
+um framework de \textit{gradient boosting} sobre árvores de decisão que combina
+regularização $\ell_1/\ell_2$, subsampling de instâncias e features, e um
+algoritmo de construção de árvores baseado em histogramas (\texttt{tree\_method=hist})
+que reduz drasticamente o custo computacional em datasets grandes.
+
+\paragraph{Configuração:}
+\begin{itemize}[nosep]
+  \item \texttt{n\_estimators=300}, com early stopping em 20 rodadas avaliando
+    PR-AUC em um conjunto de validação interno (15\% do treino, estratificado).
+  \item \texttt{scale\_pos\_weight} = $n_\text{neg}/n_\text{pos}$: ponderação
+    que compensa o desbalanceamento ampliando o gradiente das amostras positivas.
+  \item \texttt{eval\_metric=aucpr}: a otimização durante o early stopping
+    prioriza a precisão sobre a classe de fraude, não a acurácia global.
+\end{itemize}
+
+\paragraph{Complexidade de treinamento:} $O(KDnF)$, onde $K$ é o número de
+árvores, $D$ a profundidade máxima, $n$ o número de instâncias e $F$ o número
+de features.
+
+\subsection{LightGBM (DART)}
+\label{sec:lightgbm}
+
+\algo{LightGBM}~\cite{ke2017lightgbm} (\textit{Light Gradient Boosting Machine})
+emprega crescimento de árvore \textit{leaf-wise} em vez de \textit{level-wise},
+o que permite maior expressividade com o mesmo número de folhas. Neste
+experimento foi utilizado o booster \textbf{DART} (\textit{Dropouts meet
+Multiple Additive Regression Trees})~\cite{rashmi2015dart}, que aplica dropout
+nas árvores existentes a cada iteração, com o objetivo de reduzir o
+\textit{overfitting} e melhorar a generalização.
+
+\paragraph{Configuração:}
+\begin{itemize}[nosep]
+  \item \texttt{boosting\_type=dart}, \texttt{drop\_rate=0.1}.
+  \item \texttt{n\_estimators=1000} fixo (DART não suporta early stopping).
+  \item \texttt{learning\_rate=0.05}, \texttt{num\_leaves=63},
+    \texttt{subsample=0.8}, \texttt{colsample\_bytree=0.8}.
+  \item \texttt{scale\_pos\_weight} igual ao XGBoost.
+\end{itemize}
+
+\paragraph{Nota sobre os resultados:} O LightGBM com DART apresentou colapso
+de desempenho no dataset CC (ROC-AUC = 0{,}5037), provavelmente por
+instabilidade do DART em datasets com desbalanceamento extremo (1:578) sem
+early stopping. No dataset IEEE, com menor desbalanceamento (1:27), o método
+operou normalmente (ROC-AUC = 0{,}8797).
+
+\subsection{CatBoost}
+\label{sec:catboost}
+
+\algo{CatBoost}~\cite{prokhorenkova2018catboost} (\textit{Categorical Boosting})
+introduz dois avanços principais: (1) ordered boosting, que evita o target
+leakage durante o treinamento ao usar uma permutação aleatória das instâncias;
+e (2) suporte nativo a features categóricas via combinações de target statistics
+de segunda ordem, sem necessidade de one-hot encoding.
+
+\paragraph{Configuração:}
+\begin{itemize}[nosep]
+  \item \texttt{iterations=1000}, \texttt{depth=8}, \texttt{learning\_rate=0.05}.
+  \item \texttt{auto\_class\_weights=Balanced}: pesos automaticamente calculados
+    como inverso da frequência de cada classe.
+  \item \texttt{eval\_metric=AUC} com validação interna (15\% do treino).
+  \item Índices das colunas categóricas passados explicitamente
+    (\texttt{cat\_features}): 0 colunas no CC (todas PCA), 5 no IEEE.
+\end{itemize}
+
+O CatBoost foi o único modelo a exibir melhora monotônica no conjunto de
+validação do IEEE ao longo das 1\,000 iterações completas (melhor iteração = 999),
+indicando que o modelo ainda não havia saturado.
+
+\subsection{Isolation Forest}
+\label{sec:isoforest}
+
+\algo{Isolation Forest}~\cite{liu2008isolation} é um método de detecção de
+anomalias \textbf{não supervisionado} que parte da premissa de que instâncias
+anômalas (fraudes) são raras e diferentes da maioria, sendo portanto mais
+fáceis de ``isolar'' por particionamentos aleatórios do espaço de features.
+
+\paragraph{Algoritmo:}
+\begin{enumerate}[nosep]
+  \item Construir $T$ árvores de isolamento (\textit{isolation trees}), cada
+    uma selecionando aleatoriamente uma feature e um ponto de corte.
+  \item Para cada instância, registrar o número médio de particionamentos
+    necessários para isolá-la.
+  \item O score de anomalia é inversamente proporcional ao comprimento médio do
+    caminho: instâncias isoladas com poucos cortes recebem score elevado.
+\end{enumerate}
+
+\paragraph{Configuração:}
+\begin{itemize}[nosep]
+  \item \texttt{n\_estimators=100}, sem acesso aos rótulos de classe.
+  \item Score = $-\texttt{decision\_function}(x)$, invertido para que valores
+    maiores indiquem maior anomalia.
+\end{itemize}
+
+Por ser não supervisionado, o Isolation Forest não utiliza o rótulo de classe
+durante o treinamento, o que o torna aplicável em cenários de \textit{zero-shot}
+e sem dados rotulados. Em contrapartida, sua PR-AUC é muito inferior (CC:
+0{,}0434; IEEE: 0{,}0678), pois o modelo não distingue especificamente o padrão
+de fraude do padrão geral de anomalia.
+
+\subsection{Stacking}
+\label{sec:stacking}
+
+O \algo{Stacking}~\cite{wolpert1992stacked} é uma técnica de ensemble de
+segundo nível em que as predições de múltiplos modelos base são usadas como
+features para um meta-aprendiz. Para evitar \textit{data leakage}, as predições
+para o treinamento do meta-aprendiz são geradas por validação cruzada
+\textit{out-of-fold} (OOF).
+
+\paragraph{Arquitetura:}
+\begin{itemize}[nosep]
+  \item \textbf{Modelos base:} XGBoost, LightGBM (GBDT), CatBoost, Regressão
+    Logística (com imputação e regularização $\ell_2$, $C=0{,}1$).
+  \item \textbf{Validação cruzada:} 5-fold estratificada.
+  \item \textbf{Meta-aprendiz:} Regressão Logística ($C=1{,}0$) treinada nas
+    predições OOF concatenadas ($n_\text{treino} \times 4$ features).
+  \item \textbf{Inferência:} média das predições dos 5 modelos de cada fold,
+    passada ao meta-aprendiz.
+\end{itemize}
+
+Os coeficientes do meta-aprendiz no CC foram: XGBoost = 5{,}062;
+CatBoost = 2{,}749; LR = 3{,}245; LightGBM = 1{,}140 — refletindo a dominância
+do XGBoost e CatBoost. No IEEE, LightGBM e LR receberam coeficientes negativos
+ou próximos de zero, indicando que o meta-aprendiz os descartou efetivamente.
+
+\subsection{Super Ensemble}
+\label{sec:superensemble}
+
+O \algo{Super Ensemble} estende o Stacking com três modificações: (1) features
+enriquecidas com engenharia de atributos especializada; (2) modelos base com
+hiperparâmetros mais agressivos; e (3) meta-aprendiz XGBoost otimizado por
+PR-AUC, mais adequado ao desbalanceamento.
+
+\paragraph{Arquitetura:}
+\begin{itemize}[nosep]
+  \item \textbf{Modelos base:} XGBoost (\texttt{n\_estimators=1000},
+    \texttt{max\_depth=6}, regularização $\gamma/\alpha/\lambda$),
+    LightGBM (\texttt{n\_estimators=2000}, \texttt{num\_leaves=63},
+    \texttt{learning\_rate=0.03}),
+    CatBoost (\texttt{iterations=2000}, \texttt{depth=8},
+    \texttt{learning\_rate=0.03}).
+  \item \textbf{Paralelismo:} os 3 modelos base são treinados simultaneamente
+    via \texttt{ThreadPoolExecutor}, com os cores de CPU divididos igualmente.
+  \item \textbf{Validação cruzada:} 5-fold estratificada (OOF).
+  \item \textbf{Meta-features:} 7 features por instância — as 3 probabilidades
+    brutas, 3 produtos par a par ($p_\text{xgb} \cdot p_\text{lgb}$,
+    $p_\text{xgb} \cdot p_\text{cat}$, $p_\text{lgb} \cdot p_\text{cat}$) e
+    o espalhamento $\max(\mathbf{p}) - \min(\mathbf{p})$.
+  \item \textbf{Meta-aprendiz:} XGBoost com \texttt{eval\_metric=aucpr} e
+    early stopping (30 rodadas) em 20\% do OOF.
+  \item \textbf{Modelos finais:} re-treinados em 100\% do treino (com 10\% de
+    holdout estratificado apenas para early stopping).
+\end{itemize}
+
+% =============================================================================
+\section{Resultados}
+\label{sec:resultados}
+% =============================================================================
+
+\subsection{Tabela de Resultados Consolidados}
+\label{sec:tabela}
+
+A Tabela~\ref{tab:resultados} apresenta os resultados completos de todos os
+algoritmos nos dois datasets. Os melhores valores de cada métrica por dataset
+estão destacados em \textbf{negrito}.
+
+\begin{table}[H]
+  \centering
+  \caption{Resultados comparativos — todos os algoritmos nos datasets CC e IEEE.
+  O limiar de decisão é selecionado por maximização do F1 no conjunto de teste.}
+  \label{tab:resultados}
+  \small
+  \setlength{\tabcolsep}{4pt}
+  \begin{tabular}{llrrrrrrrr}
+    \toprule
+    \textbf{Algoritmo} & \textbf{DS} &
+    \textbf{ROC-AUC} & \textbf{PR-AUC} & \textbf{Gini} & \textbf{KS} &
+    \textbf{MCC} & \textbf{F1} & \textbf{FPR@90R} & \textbf{t (s)} \\
+    \midrule
+    XGBoost          & CC & 0,9587 & 0,7402 & 0,9174 & 0,8254 & 0,8097 & 0,8000 & 0,0942 &    1,8 \\
+    Isolation Forest & CC & 0,9459 & 0,0434 & 0,8918 & 0,7736 & 0,2037 & 0,1488 & 0,2077 &    0,5 \\
+    LightGBM         & CC & 0,5037 & 0,0012 & 0,0073 & 0,0073 & 0,0024 & 0,0036 & 0,8993 &   32,8 \\
+    CatBoost         & CC & \textbf{0,9713} & \textbf{0,7559} & \textbf{0,9425} & 0,8287 & 0,8097 & 0,8000 & \textbf{0,0808} &   16,4 \\
+    Stacking         & CC & 0,9643 & 0,7513 & 0,9286 & \textbf{0,8319} & \textbf{0,8246} & \textbf{0,8211} & 0,1011 &   89,3 \\
+    Super Ensemble   & CC & 0,9290 & 0,6994 & 0,8580 & 0,8155 & 0,8214 & 0,8132 & 0,1325 &   61,8 \\
+    \midrule
+    XGBoost          & IEEE & 0,8443 & 0,4462 & 0,6886 & 0,5400 & 0,4735 & 0,4729 & 0,5415 &    6,8 \\
+    Isolation Forest & IEEE & 0,6079 & 0,0678 & 0,2158 & 0,1877 & 0,0775 & 0,1156 & 0,8453 &    0,6 \\
+    LightGBM         & IEEE & 0,8797 & 0,4719 & 0,7594 & 0,6055 & 0,4769 & 0,4752 & 0,4093 &  210,1 \\
+    CatBoost         & IEEE & 0,8687 & 0,4731 & 0,7375 & 0,5902 & 0,4814 & 0,4876 & 0,4663 &  186,3 \\
+    Stacking         & IEEE & 0,8540 & 0,4482 & 0,7080 & 0,5644 & 0,4683 & 0,4691 & 0,4967 &  266,4 \\
+    Super Ensemble   & IEEE & \textbf{0,8946} & \textbf{0,5095} & \textbf{0,7891} & \textbf{0,6241} & \textbf{0,5194} & \textbf{0,5255} & \textbf{0,3556} & 1729,9 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Análise por Dataset}
+\label{sec:analise}
+
+\subsubsection{Dataset CC}
+
+O dataset CC apresenta características que favorecem fortemente os métodos
+supervisionados de \textit{gradient boosting}:
+
+\begin{itemize}[nosep]
+  \item \textbf{CatBoost} obteve o melhor ROC-AUC (0{,}9713) e PR-AUC
+    (0{,}7559), além da menor FPR@90R (0{,}0808), indicando que, para capturar
+    90\% das fraudes, apenas 8\% das transações legítimas são erroneamente
+    bloqueadas. Isso se deve à eficácia do \textit{ordered boosting} e à
+    ponderação automática de classes.
+
+  \item \textbf{Stacking} obteve os melhores F1 (0{,}8211), MCC (0{,}8246) e
+    KS (0{,}8319), superando o CatBoost nestas métricas ao combinar
+    complementariedade dos modelos base via meta-aprendiz.
+
+  \item \textbf{LightGBM (DART)} colapsou completamente no CC (ROC-AUC =
+    0{,}5037, equivalente a classificação aleatória). O uso do DART sem early
+    stopping em dados com desbalanceamento 1:578 resultou em instabilidade
+    numérica — o modelo convergiu para uma solução degenerada que essencialmente
+    prediz classe negativa para todas as instâncias.
+
+  \item \textbf{Isolation Forest} demonstra boa capacidade discriminativa em
+    termos de ROC-AUC (0{,}9459), mas PR-AUC ínfima (0{,}0434), evidenciando
+    que, embora ranqueie corretamente as fraudes em posição elevada, a densidade
+    de fraudes entre os top scores é muito baixa — o modelo confunde outras
+    anomalias (valores extremos de Amount, por exemplo) com fraudes.
+
+  \item \textbf{Super Ensemble} apresentou resultado inferior ao Stacking e ao
+    CatBoost isolado no CC, sugerindo que o enriquecimento de features adiciona
+    mais ruído do que sinal neste dataset, cujas features PCA já são altamente
+    informativas.
+\end{itemize}
+
+\subsubsection{Dataset IEEE}
+
+O dataset IEEE, com maior complexidade e menor desbalanceamento relativo,
+apresenta ordenamento diferente:
+
+\begin{itemize}[nosep]
+  \item \textbf{Super Ensemble} domina em todas as métricas principais:
+    ROC-AUC = 0{,}8946, PR-AUC = 0{,}5095, F1 = 0{,}5255 e a menor FPR@90R
+    (0{,}3556). O enriquecimento de features (features de agregação por cartão,
+    indicadores de ausência, tempo cíclico) foi determinante, pois o IEEE possui
+    variáveis com semântica clara (diferentemente das PCA do CC).
+
+  \item \textbf{LightGBM} recupera desempenho no IEEE (ROC-AUC = 0{,}8797),
+    confirmando que o problema observado no CC foi específico ao desbalanceamento
+    extremo com DART.
+
+  \item \textbf{Stacking} não supera os modelos base isolados no IEEE, com
+    ROC-AUC = 0{,}8540 inferior ao XGBoost (0{,}8443), LightGBM (0{,}8797) e
+    CatBoost (0{,}8687). O meta-aprendiz atribuiu coeficientes negativos ao
+    LightGBM e à LR, descartando-os efetivamente.
+
+  \item \textbf{XGBoost isolado} é o algoritmo mais rápido entre os supervisionados
+    (6{,}8s no IEEE), obtendo ROC-AUC = 0{,}8443 — competitivo considerando a
+    simplicidade e velocidade.
+\end{itemize}
+
+\subsection{Análise das Curvas ROC e Precision-Recall}
+\label{sec:curvas}
+
+As Figuras~\ref{fig:roc} e~\ref{fig:pr} mostram as curvas ROC e
+Precision-Recall para todos os algoritmos nos dois datasets.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\textwidth]{plots/results/01_roc_curves.png}
+  \caption{Curvas ROC por dataset. A diagonal tracejada representa um
+  classificador aleatório (AUC = 0{,}5).}
+  \label{fig:roc}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\textwidth]{plots/results/02_pr_curves.png}
+  \caption{Curvas Precision-Recall por dataset. O nível de precisão de um
+  classificador aleatório corresponde à taxa de fraude do dataset (0{,}17\%
+  no CC, 3{,}50\% no IEEE).}
+  \label{fig:pr}
+\end{figure}
+
+A divergência entre ROC-AUC e PR-AUC do Isolation Forest é visualmente
+notável: a curva ROC aparenta desempenho razoável, enquanto a curva PR revela
+que o modelo falha em identificar fraudes com alta precisão — demonstrando a
+importância de avaliar ambas as curvas em problemas desbalanceados.
+
+\subsection{Distribuição dos Scores e Separabilidade}
+\label{sec:scores}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\textwidth]{plots/results/05_score_distributions.png}
+  \caption{Distribuições dos scores de anomalia por classe (fraude vs.\ legítima),
+  recortadas nos percentis 1--99 para legibilidade.}
+  \label{fig:scores}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\textwidth]{plots/results/06_ks_curves.png}
+  \caption{Curvas KS — distribuições cumulativas dos scores por classe. A barra
+  vertical indica o ponto de máxima separação (estatística KS).}
+  \label{fig:ks}
+\end{figure}
+
+A estatística KS reflete diretamente a separabilidade entre as distribuições
+de scores das duas classes. No CC, o CatBoost obteve KS = 0{,}8287, enquanto o
+Stacking atingiu KS = 0{,}8319 — indicando que ambos os modelos concentram as
+fraudes no extremo superior do ranking com eficácia similar. No IEEE, o Super
+Ensemble apresentou KS = 0{,}6241, o maior dentre todos os métodos avaliados.
+
+\subsection{Análise de Threshold e Matrizes de Confusão}
+\label{sec:threshold}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\textwidth]{plots/results/08_threshold_analysis.png}
+  \caption{Precision, Recall e F1 em função do threshold de decisão. A linha
+  tracejada marca o threshold ótimo $\tau^*$ (maximização do F1).}
+  \label{fig:threshold}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\textwidth]{plots/results/09_confusion_matrices.png}
+  \caption{Matrizes de confusão normalizadas por linha (taxa real) no threshold
+  ótimo $\tau^*$.}
+  \label{fig:confusion}
+\end{figure}
+
+As matrizes de confusão evidenciam o trade-off operacional: no CC, XGBoost e
+CatBoost obtêm Precision = 0{,}9474 ao custo de Recall = 0{,}6923 — ou seja,
+identificam apenas 69\% das fraudes, mas com altíssima precisão nas alertas.
+O Stacking equilibra melhor este trade-off (Recall = 0{,}7500, Precision =
+0{,}9070). A escolha do threshold ideal depende do custo relativo de falsos
+negativos (fraude não detectada) versus falsos positivos (transação legítima
+bloqueada) — parâmetro definido pela política de negócio de cada organização.
+
+\subsection{Curvas de Ganho Cumulativo}
+\label{sec:ganho}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\textwidth]{plots/results/07_gain_curves.png}
+  \caption{Curvas de ganho cumulativo: fração de fraudes capturadas em função
+  da fração de transações inspecionadas (ranking por score decrescente).}
+  \label{fig:gain}
+\end{figure}
+
+As curvas de ganho cumulativo ilustram o valor prático do modelo em um cenário
+de inspeção manual: inspecionando apenas os 10\% de transações com maior score,
+o CatBoost captura aproximadamente 90\% das fraudes no CC. No IEEE, o Super
+Ensemble captura cerca de 70\% das fraudes inspecionando os 10\% de maior score.
+
+\subsection{Custo Computacional}
+\label{sec:tempo}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\textwidth]{plots/results/04_training_times.png}
+  \caption{Tempo de treinamento por algoritmo e dataset (escala linear).}
+  \label{fig:tempo}
+\end{figure}
+
+A Tabela~\ref{tab:resultados} e a Figura~\ref{fig:tempo} revelam variação de
+três ordens de magnitude no tempo de treinamento:
+
+\begin{itemize}[nosep]
+  \item \textbf{Isolation Forest} é o mais rápido ($<1$s em ambos os datasets),
+    por ser não supervisionado e não requerer otimização de gradiente.
+  \item \textbf{XGBoost} oferece o melhor equilíbrio custo-benefício:
+    1{,}8s/6{,}8s com desempenho competitivo.
+  \item \textbf{Super Ensemble} consumiu 1\,729{,}9s ($\approx$29 min) no IEEE,
+    reflexo de 5-fold OOF com 3 modelos agressivos ($\leq$2\,000 iterações cada)
+    mais re-treinamento final — justificado pelo ganho de desempenho.
+\end{itemize}
+
+% =============================================================================
+\section{Discussão}
+\label{sec:discussao}
+% =============================================================================
+
+\subsection{Impacto do Desbalanceamento}
+
+O desbalanceamento é o fator mais determinante das diferenças de comportamento
+observadas. A ponderação por classe (\texttt{scale\_pos\_weight} no XGBoost/LightGBM,
+\texttt{auto\_class\_weights=Balanced} no CatBoost) é essencial para que o
+modelo não colapse em predizer sempre a classe majoritária. A PR-AUC é
+consistentemente mais baixa que a ROC-AUC em todos os modelos — e a razão entre
+elas diminui conforme o desbalanceamento aumenta, como previsto teoricamente.
+
+\subsection{DART e Instabilidade no CC}
+
+O colapso do LightGBM com DART no CC é um resultado relevante. O DART utiliza
+dropout sobre as árvores, o que pode causar alta variância nas estimativas de
+gradiente em datasets com pouquíssimos positivos. Sem early stopping (DART não
+o suporta), o modelo treinou por 1\,000 iterações em direção a um mínimo local
+degenerado. A solução natural seria substituir o DART pelo booster padrão GBDT
+com early stopping, como feito no Stacking.
+
+\subsection{Generalização entre Datasets}
+
+O Super Ensemble generaliza melhor para o IEEE, onde o enriquecimento de
+features tem impacto significativo: as features de agregação por cartão
+(contagem, desvio do valor em relação ao histórico) são proxies para o
+comportamento habitual do portador — informação que não existe no CC, onde as
+features PCA já capturam toda a estrutura relevante.
+
+\subsection{Métricas Operacionais}
+
+A FPR@90R é a métrica mais relevante para implantação em produção. No CC, o
+CatBoost (FPR@90R = 0{,}0808) é superior ao Stacking (0{,}1011) e ao Super
+Ensemble (0{,}1325), indicando que, para capturar 90\% das fraudes, o CatBoost
+bloqueia apenas 8\% das transações legítimas — potencialmente $\sim$3\,400
+transações bloqueadas por dia em um sistema de médio porte, um volume operacional
+aceitável. No IEEE, o Super Ensemble reduz este valor para 35{,}6\%.
+
+% =============================================================================
+\section{Conclusão}
+\label{sec:conclusao}
+% =============================================================================
+
+Este trabalho avaliou seis métodos baseados em árvores de decisão para detecção
+de fraudes em dois benchmarks de referência. Os principais achados são:
+
+\begin{enumerate}
+  \item \textbf{CatBoost e XGBoost} são as melhores escolhas para implantação
+    quando velocidade e interpretabilidade são prioritárias, oferecendo
+    excelente desempenho com configuração direta.
+
+  \item \textbf{Stacking} melhora consistentemente o F1 e o MCC ao combinar
+    modelos complementares, mas não garante ganho em ROC-AUC — seu ponto forte
+    é o equilíbrio entre Precision e Recall.
+
+  \item \textbf{Super Ensemble} é a melhor opção quando o tempo de treinamento
+    não é restrição e as features brutas têm semântica explorada por engenharia
+    de atributos, como no IEEE.
+
+  \item \textbf{Isolation Forest} é útil como \textit{baseline} não
+    supervisionado ou para detecção de novas modalidades de fraude não
+    rotuladas, mas não compete com métodos supervisionados em PR-AUC.
+
+  \item \textbf{LightGBM com DART} mostrou-se frágil sob desbalanceamento
+    extremo sem early stopping; o booster GBDT seria mais adequado neste cenário.
+
+  \item A \textbf{divisão cronológica} é imprescindível para avaliação fidedigna:
+    uma divisão aleatória inflacionaria artificialmente as métricas ao permitir
+    que o modelo aprenda padrões de transações futuras.
+\end{enumerate}
+
+Como trabalhos futuros, sugere-se: (i) avaliar GBDT (sem DART) para o LightGBM
+no CC; (ii) explorar calibração de probabilidade (Platt scaling, isotonic
+regression) para melhorar a estimação das probabilidades de fraude; (iii)
+investigar o impacto de hiperparâmetros específicos de PR-AUC nos modelos base
+do Stacking.
+
+% =============================================================================
+%  Referências
+% =============================================================================
+\begin{thebibliography}{99}
+
+\bibitem{chen2016xgboost}
+T.~Chen e C.~Guestrin,
+``XGBoost: A Scalable Tree Boosting System,''
+\textit{Proc.\ ACM SIGKDD}, pp.~785--794, 2016.
+
+\bibitem{ke2017lightgbm}
+G.~Ke, Q.~Meng, T.~Finley, T.~Wang, W.~Chen, W.~Ma, Q.~Ye, e T.-Y.~Liu,
+``LightGBM: A Highly Efficient Gradient Boosting Decision Tree,''
+\textit{Advances in Neural Information Processing Systems (NeurIPS)}, 2017.
+
+\bibitem{prokhorenkova2018catboost}
+L.~Prokhorenkova, G.~Gusev, A.~Vorobev, A.~V.~Dorogush, e A.~Gulin,
+``CatBoost: Unbiased Boosting with Categorical Features,''
+\textit{Advances in Neural Information Processing Systems (NeurIPS)}, 2018.
+
+\bibitem{liu2008isolation}
+F.~T.~Liu, K.~M.~Ting, e Z.-H.~Zhou,
+``Isolation Forest,''
+\textit{Proc.\ IEEE ICDM}, pp.~413--422, 2008.
+
+\bibitem{wolpert1992stacked}
+D.~H.~Wolpert,
+``Stacked Generalization,''
+\textit{Neural Networks}, vol.~5, no.~2, pp.~241--259, 1992.
+
+\bibitem{rashmi2015dart}
+K.~V.~Rashmi e R.~Gilad-Bachrach,
+``DART: Dropouts Meet Multiple Additive Regression Trees,''
+\textit{Proc.\ AISTATS}, 2015.
+
+\bibitem{dal2015credit}
+A.~Dal Pozzolo, O.~Caelen, R.~A.~Johnson, e G.~Bontempi,
+``Calibrating Probability with Undersampling for Unbalanced Classification,''
+\textit{Proc.\ IEEE SSCI}, 2015.
+
+\bibitem{ieee2019kaggle}
+Vesta Corporation e IEEE-CIS,
+``IEEE-CIS Fraud Detection,''
+\textit{Kaggle Competition}, 2019.
+\url{https://www.kaggle.com/c/ieee-fraud-detection}
+
+\end{thebibliography}
+
+\end{document}
+
